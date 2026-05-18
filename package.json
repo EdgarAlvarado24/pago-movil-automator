@@ -10,10 +10,10 @@
     "test:parse": "node src/parser.js --test"
   },
   "dependencies": {
-    "googleapis": "^134.0.0",
-    "node-telegram-bot-api": "^0.66.0",
-    "tesseract.js": "^5.1.0",
     "dotenv": "^16.4.0",
-    "node-fetch": "^3.3.0"
+    "googleapis": "^134.0.0",
+    "grammy": "^1.43.0",
+    "node-fetch": "^3.3.0",
+    "tesseract.js": "^5.1.0"
   }
 }
