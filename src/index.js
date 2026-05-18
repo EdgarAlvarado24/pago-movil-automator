@@ -46,7 +46,7 @@ export async function processPayment(rawText, options = {}) {
   let tasaBs = null;
   let tasaInfo = null;
   try {
-    tasaInfo = await getExchangeRate();
+    tasaInfo = await getExchangeRate(parsed.fecha);
     tasaBs = tasaInfo.rate;
   } catch (err) {
     console.warn('⚠️ No se pudo obtener tasa:', err.message);

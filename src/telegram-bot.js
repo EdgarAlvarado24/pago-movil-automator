@@ -19,7 +19,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { config } from './config.js';
 import { PagoMovilParser } from './parser.js';
-import { getExchangeRate } from './exchange-rate.js';
+import { getExchangeRate, getCachedRates } from './exchange-rate.js';
 import { SheetsManager } from './sheets.js';
 import { extractTextFromImage } from './ocr.js';
 
@@ -98,6 +98,8 @@ async function startBot() {
       `📌 *Tu ID:* \`${ctx.from?.id || ctx.chat.id}\`\n\n` +
       'Comandos:\n' +
       '/tasa — Ver la tasa de cambio del día\n' +
+      '/tasa — Ver la tasa de cambio del día\n' +
+      '/cache — Ver tasas cacheadas por fecha\n' +
       '/ultimo — Ver el último registro\n' +
       '/cancelar — Cancelar operación pendiente',
       { parse_mode: 'Markdown' }
@@ -130,6 +132,19 @@ async function startBot() {
   });
 
   // ---- /ultimo ----
+  // ---- /cache ----
+  bot.command('cache', async (ctx) => {
+    if (!isAllowed(ctx.chat.id)) return;
+    const rates = getCachedRates();
+    if (typeof rates === 'string' && rates.startsWith('📭')) {
+      await ctx.reply(rates);
+    } else {
+      await ctx.reply(`🗂️ *Tasas cacheadas:*
+
+${escMD(rates)}`, { parse_mode: 'Markdown' });
+    }
+  });
+
   bot.command('ultimo', async (ctx) => {
     if (!isAllowed(ctx.chat.id)) return;
 
@@ -212,7 +227,7 @@ async function startBot() {
       await ctx.reply('💱 Obteniendo tasa de cambio del día...');
       let tasaData;
       try {
-        tasaData = await getExchangeRate();
+        tasaData = await getExchangeRate(parsed.fecha);
       } catch (err) {
         tasaData = { rate: null, source: 'No disponible' };
         await ctx.reply(
