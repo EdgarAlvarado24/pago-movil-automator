@@ -1,0 +1,19 @@
+{
+  "name": "pago-movil-automator",
+  "version": "1.0.0",
+  "description": "Automatizador de gastos - extrae datos de Pago Móvil Banesco y los registra en Google Sheets",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "bot": "node src/telegram-bot.js",
+    "test:parse": "node src/parser.js --test"
+  },
+  "dependencies": {
+    "googleapis": "^134.0.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "tesseract.js": "^5.1.0",
+    "dotenv": "^16.4.0",
+    "node-fetch": "^3.3.0"
+  }
+}

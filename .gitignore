@@ -1,0 +1,24 @@
+# === Secrets ===
+.env
+
+# === Temp / Cache ===
+tmp/
+temp/
+/tmp/
+spa.traineddata
+*.jpg
+*.png
+
+# === Node ===
+node_modules/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+*.log
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
