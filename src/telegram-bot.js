@@ -7,13 +7,13 @@ import os from 'os';
 import { config } from './config.js';
 import { PagoMovilParser } from './parser.js';
 import { getExchangeRate, getCachedRates } from './exchange-rate.js';
-import { SheetsManager } from './sheets.js';
+import { SheetsManager, createSpreadsheet } from './sheets.js';
 import { extractTextFromImage } from './ocr.js';
 import { runMigrations } from './db/migrations.js';
 import {
   findOrCreateUser,
   getCredentials,
-  saveCredentials,
+  saveOAuthTokens,
   getPreferences,
   upsertPreferences,
   listUsers,
@@ -22,11 +22,38 @@ import {
   logPayment,
   getPaymentStats,
   getDefaultSheetColumns,
+  deleteUserData,
 } from './db/queries.js';
+import { generateAuthUrl, exchangeCode, refreshAccessTokenIfNeeded } from './oauth.js';
+import { startAuthServer } from './auth-server.js';
 import logger from './logger.js';
 
 const TEMP_DIR = path.join(os.tmpdir(), 'pago-movil-bot');
 const pendingConfirmations = new Map();
+const oauthPending = new Map();
+const rateLimit = new Map();
+const RATE_LIMIT_WINDOW = 60_000;
+const RATE_LIMIT_MAX = 10;
+
+function checkRateLimit(telegramId) {
+  const now = Date.now();
+  const entry = rateLimit.get(telegramId) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW };
+
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + RATE_LIMIT_WINDOW;
+  }
+
+  entry.count++;
+  rateLimit.set(telegramId, entry);
+
+  if (entry.count > RATE_LIMIT_MAX) {
+    const waitSec = Math.ceil((entry.resetAt - now) / 1000);
+    return { allowed: false, waitSec };
+  }
+
+  return { allowed: true };
+}
 
 function escMD(text) {
   if (!text) return '';
@@ -113,20 +140,44 @@ async function startBot() {
 
   async function requireCredentials(ctx, user) {
     const creds = await getCredentials(user.id);
-    if (!creds || !creds.service_account_json || !creds.spreadsheet_id) {
+    const hasAuth = creds?.refresh_token || creds?.service_account_json;
+    if (!hasAuth || !creds?.spreadsheet_id) {
       await ctx.reply(
         '⚠️ *Configuración pendiente*\n\n' +
-        'Antes de usar el bot, necesitas configurar tu conexión a Google Sheets.\n\n' +
-        'Usa /setup para comenzar la configuración.\n\n' +
-        'Necesitarás:\n' +
-        '1️⃣ El JSON de tu Service Account de Google Cloud\n' +
-        '2️⃣ El ID de tu hoja de cálculo de Google Sheets\n\n' +
-        '¿Listo? Envía /setup',
+        'Antes de usar el bot, necesitas conectar tu Google Sheets.\n\n' +
+        'Usa /setup y autoriza con tu cuenta de Google.\n\n' +
+        'Solo toma 30 segundos. 🚀',
         { parse_mode: 'Markdown' }
       );
       return null;
     }
     return creds;
+  }
+
+  async function getSheetsManager(userId) {
+    const creds = await getCredentials(userId);
+    if (!creds || !creds.spreadsheet_id) return null;
+
+    const prefs = await getPreferences(userId);
+
+    if (creds.refresh_token) {
+      const accessToken = await refreshAccessTokenIfNeeded(creds.refresh_token);
+      return new SheetsManager({
+        accessToken,
+        spreadsheetId: creds.spreadsheet_id,
+        sheetColumns: prefs?.sheet_columns || null,
+      });
+    }
+
+    if (creds.service_account_json) {
+      return new SheetsManager({
+        serviceAccountJson: creds.service_account_json,
+        spreadsheetId: creds.spreadsheet_id,
+        sheetColumns: prefs?.sheet_columns || null,
+      });
+    }
+
+    return null;
   }
 
   bot.command('start', async (ctx) => {
@@ -179,22 +230,68 @@ async function startBot() {
     const user = await requireRegistered(ctx);
     if (!user) return;
 
-    await ctx.reply(
-      '🔧 *Configuración de Google Sheets*\n\n' +
-      'Paso 1: *Service Account*\n\n' +
-      'Necesitas un Service Account de Google Cloud con acceso a Google Sheets.\n\n' +
-      'Si no tienes uno:\n' +
-      '1. Ve a https://console.cloud.google.com/\n' +
-      '2. Crea un proyecto o selecciona uno existente\n' +
-      '3. Ve a "IAM y Administración" > "Cuentas de servicio"\n' +
-      '4. Crea una cuenta de servicio y genera una clave JSON\n' +
-      '5. Descarga el archivo JSON\n\n' +
-      '*Envía el contenido del JSON como un mensaje de texto* (empieza con `{` y termina con `}`).\n\n' +
-      '¿Listo? Envía tu JSON de Service Account:',
-      { parse_mode: 'Markdown' }
-    );
+    const creds = await getCredentials(user.id);
+    if (creds?.refresh_token || creds?.service_account_json) {
+      await ctx.reply(
+        '⚠️ *Ya tienes Google Sheets configurado.*\n\n' +
+        'Si quieres reconectar con una cuenta diferente:\n' +
+        '1. Primero revoca el acceso en: https://myaccount.google.com/permissions\n' +
+        '2. Luego usa /setup de nuevo\n\n' +
+        'O usa /remove para borrar tu configuración actual y empezar de cero.',
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
 
-    pendingConfirmations.set(`setup:sa:${ctx.chat.id}`, { userId: user.id });
+    if (!config.oauth.clientId || !config.oauth.clientSecret) {
+      await ctx.reply(
+        '❌ *OAuth2 no configurado*\n\n' +
+        'El administrador del bot aún no ha configurado las credenciales de Google.\n\n' +
+        'Comunícate con el admin y pídele que configure:\n' +
+        '• `GOOGLE_CLIENT_ID`\n' +
+        '• `GOOGLE_CLIENT_SECRET`\n\n' +
+        'en el archivo `.env` del servidor.\n\n' +
+        'Mientras tanto, los comandos de administración siguen funcionando.',
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    const state = crypto.randomUUID();
+    const redirectUri = config.oauth.redirectUri;
+    const authUrl = generateAuthUrl(state, redirectUri);
+
+    oauthPending.set(state, {
+      userId: user.id,
+      chatId: ctx.chat.id,
+      redirectUri,
+      notify: (msg) => ctx.api.sendMessage(ctx.chat.id, msg, { parse_mode: 'Markdown' }),
+      createdAt: Date.now(),
+    });
+
+    const usesLocalhost = redirectUri.includes('127.0.0.1') || redirectUri.includes('localhost');
+
+    const autoHelp = usesLocalhost
+      ? '\n✅ *Si estás en la misma máquina del bot*, la autorización será automática.'
+      : '';
+
+    await ctx.reply(
+      '🔧 *Configuración con Google OAuth2*\n\n' +
+      'Voy a pedirte acceso a tu Google Sheets.\n\n' +
+      '1️⃣ Haz click en el enlace de abajo\n' +
+      '2️⃣ Inicia sesión con tu cuenta de Google\n' +
+      '3️⃣ Acepta los permisos solicitados\n' +
+      '4️⃣ Vuelve a Telegram\n' +
+      `${autoHelp}\n\n` +
+      '❓ *¿No funciona el paso automático?*\n' +
+      'Si ves un error de conexión después de autorizar:\n' +
+      '   a) *Copia la URL completa* de la barra de direcciones\n' +
+      '   b) Pégala aquí en el chat\n' +
+      '   c) Yo extraeré el código automáticamente\n\n' +
+      `🔗 [Autorizar Google Sheets](${authUrl})\n\n` +
+      '⏳ *Este enlace expira en 5 minutos.*',
+      { parse_mode: 'Markdown', disable_web_page_preview: true }
+    );
   });
 
   bot.command('config', async (ctx) => {
@@ -204,10 +301,16 @@ async function startBot() {
     const creds = await getCredentials(user.id);
     const prefs = await getPreferences(user.id);
 
+    const authMethod = creds?.refresh_token
+      ? '✅ OAuth2 (Google)'
+      : creds?.service_account_json
+        ? '⚠️ Service Account (legacy)'
+        : '❌ No configurado';
+
     const lines = [
       '📋 *Tu configuración*\n',
-      `📊 Spreadsheet ID: \`${creds?.spreadsheet_id || '❌ No configurado'}\``,
-      `🔑 Service Account: ${creds?.service_account_json ? '✅ Configurado' : '❌ No configurado'}`,
+      `📊 Spreadsheet: \`${creds?.spreadsheet_id || '❌ No configurado'}\``,
+      `🔑 Autenticación: ${authMethod}`,
       '',
       '💱 *Preferencias de tasa:*',
       `   Fuente: \`${prefs?.exchange_source || 'dolarapi'}\``,
@@ -238,12 +341,11 @@ async function startBot() {
     const statusMsg = await ctx.reply('🔍 Probando conexión a Google Sheets...');
 
     try {
-      const prefs = await getPreferences(user.id);
-      const sheets = new SheetsManager({
-        serviceAccountJson: creds.service_account_json,
-        spreadsheetId: creds.spreadsheet_id,
-        sheetColumns: prefs?.sheet_columns || null,
-      });
+      const sheets = await getSheetsManager(user.id);
+      if (!sheets) {
+        await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, '❌ No se pudo inicializar la conexión.');
+        return;
+      }
 
       await sheets.init();
 
@@ -316,12 +418,11 @@ async function startBot() {
     if (!creds) return;
 
     try {
-      const prefs = await getPreferences(user.id);
-      const sheets = new SheetsManager({
-        serviceAccountJson: creds.service_account_json,
-        spreadsheetId: creds.spreadsheet_id,
-        sheetColumns: prefs?.sheet_columns || null,
-      });
+      const sheets = await getSheetsManager(user.id);
+      if (!sheets) {
+        await ctx.reply('❌ No se pudo inicializar la conexión a Sheets.');
+        return;
+      }
 
       await sheets.init();
       const lastRow = await sheets.getLastDataRow();
@@ -346,21 +447,41 @@ async function startBot() {
 
   bot.command('cancelar', async (ctx) => {
     const confirmKey = `confirm:${ctx.chat.id}`;
-    const saKey = `setup:sa:${ctx.chat.id}`;
-    const sidKey = `setup:sid:${ctx.chat.id}`;
+    const choiceKey = `setup:choice:${ctx.chat.id}`;
 
-    if (pendingConfirmations.has(confirmKey)) {
-      pendingConfirmations.delete(confirmKey);
+    const anyKey = [confirmKey, choiceKey].find(k => pendingConfirmations.has(k));
+    if (anyKey) {
+      pendingConfirmations.delete(anyKey);
       await ctx.reply('✅ Operación cancelada.');
-    } else if (pendingConfirmations.has(saKey)) {
-      pendingConfirmations.delete(saKey);
-      await ctx.reply('✅ Configuración cancelada.');
-    } else if (pendingConfirmations.has(sidKey)) {
-      pendingConfirmations.delete(sidKey);
-      await ctx.reply('✅ Configuración cancelada.');
     } else {
       await ctx.reply('No hay ninguna operación pendiente.');
     }
+  });
+
+  bot.command('remove', async (ctx) => {
+    const user = await ensureUser(ctx);
+    if (!user) return;
+
+    await ctx.reply(
+      '⚠️ *¿Estás seguro?*\n\n' +
+      'Esto eliminará todos tus datos del bot:\n' +
+      '• Tus credenciales de Google\n' +
+      '• Tus preferencias de formato\n' +
+      '• Tu registro de pagos\n\n' +
+      '*No elimina tus hojas de cálculo*, solo los datos guardados en el bot.\n\n' +
+      '¿Confirmas?',
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Sí, borrar mis datos', callback_data: 'remove_confirm' },
+              { text: '❌ No, cancelar', callback_data: 'remove_cancel' },
+            ],
+          ],
+        },
+      }
+    );
   });
 
   bot.command('cache', async (ctx) => {
@@ -394,6 +515,7 @@ async function startBot() {
       '',
       '🛠️ *Utilidades*',
       '/cancelar — Cancelar operación pendiente',
+      '/remove — Borrar mis datos del bot',
       '/help — Mostrar esta ayuda',
     ];
 
@@ -555,6 +677,12 @@ async function startBot() {
     const user = await requireRegistered(ctx);
     if (!user) return;
 
+    const rl = checkRateLimit(user.telegram_id);
+    if (!rl.allowed) {
+      await ctx.reply(`⏳ *Demasiadas solicitudes.* Espera ${rl.waitSec} segundos.`, { parse_mode: 'Markdown' });
+      return;
+    }
+
     const creds = await requireCredentials(ctx, user);
     if (!creds) return;
 
@@ -618,15 +746,19 @@ async function startBot() {
         ? (parsed.montoBolivares / tasaData.rate).toFixed(2)
         : 'N/A';
 
+      const tipoInicial = 'Salida';
+
       pendingConfirmations.set(`confirm:${ctx.chat.id}`, {
         parsed,
         tasaBs: tasaData.rate,
         montoDolares,
         userId: user.id,
+        tipo: tipoInicial,
         _createdAt: Date.now(),
       });
 
       const tasaStr = tasaData.rate ? escMD(tasaData.rate.toFixed(2)) : 'N/A';
+      const tipoIcon = tipoInicial === 'Salida' ? '📤' : '📥';
 
       await ctx.reply(
         `📋 *Datos extraídos — Revisa antes de guardar:*\n\n` +
@@ -639,7 +771,8 @@ async function startBot() {
         `📱 *Origen:* ${escMD(parsed.pagador || '?')}\n` +
         `📱 *Destino:* ${escMD(parsed.beneficiario || '?')}\n` +
         `🏦 *Emisor:* ${escMD(parsed.bancoEmisor || '?')}\n` +
-        `🏦 *Receptor:* ${escMD(parsed.bancoReceptor || '?')}\n\n` +
+        `🏦 *Receptor:* ${escMD(parsed.bancoReceptor || '?')}\n` +
+        `🏷️ *Tipo:* ${tipoIcon} ${tipoInicial}\n\n` +
         `📝 *Especificación:* Ref: ${escMD(parsed.referencia || '?')}` +
           (parsed.concepto ? ` - ${escMD(parsed.concepto || '')}` : '') + '\n\n' +
         `¿Guardar en tu hoja de cálculo?`,
@@ -649,6 +782,7 @@ async function startBot() {
             inline_keyboard: [
               [
                 { text: '✅ Aceptar y guardar', callback_data: 'confirm' },
+                { text: '🔄 Entrada/Salida', callback_data: 'toggle_tipo' },
                 { text: '❌ Cancelar', callback_data: 'cancel' },
               ],
             ],
@@ -665,7 +799,48 @@ async function startBot() {
   bot.on('callback_query:data', async (ctx) => {
     const chatId = ctx.chat.id;
     const data = ctx.callbackQuery.data;
-    const key = `confirm:${chatId}`;
+    const confirmKey = `confirm:${chatId}`;
+    const choiceKey = `setup:choice:${chatId}`;
+
+    if (data === 'setup_cancel') {
+      pendingConfirmations.delete(choiceKey);
+      await ctx.editMessageText('❌ Configuración cancelada.');
+      await ctx.answerCallbackQuery('Cancelado');
+      return;
+    }
+
+    if (data === 'remove_cancel') {
+      await ctx.editMessageText('✅ Operación cancelada. Tus datos están a salvo.');
+      await ctx.answerCallbackQuery('Cancelado');
+      return;
+    }
+
+    if (data === 'remove_confirm') {
+      const telegramId = ctx.from?.id || ctx.chat?.id;
+      if (!telegramId) {
+        await ctx.answerCallbackQuery('Error');
+        return;
+      }
+
+      try {
+        await ctx.editMessageText('🗑️ Eliminando tus datos...');
+        await deleteUserData(telegramId);
+        await ctx.reply(
+          '✅ *Datos eliminados.*\n\n' +
+          'Tus credenciales, preferencias y registro de pagos han sido borrados.\n\n' +
+          'Si quieres volver a usar el bot, envía /start y configura todo de nuevo.',
+          { parse_mode: 'Markdown' }
+        );
+        await ctx.answerCallbackQuery('✅ Datos eliminados');
+      } catch (err) {
+        logger.error('Error eliminando datos de usuario', { telegramId, error: err.message });
+        await ctx.reply(`❌ Error al eliminar datos: ${err.message}`);
+        await ctx.answerCallbackQuery('Error');
+      }
+      return;
+    }
+
+    const key = confirmKey;
 
     if (!pendingConfirmations.has(key)) {
       await ctx.answerCallbackQuery('No hay operación pendiente');
@@ -681,25 +856,39 @@ async function startBot() {
       return;
     }
 
+    if (data === 'toggle_tipo') {
+      const newTipo = pending.tipo === 'Salida' ? 'Entrada' : 'Salida';
+      pending.tipo = newTipo;
+      pendingConfirmations.set(key, pending);
+
+      const tipoIcon = newTipo === 'Salida' ? '📤' : '📥';
+      await ctx.editMessageReplyMarkup({
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Aceptar y guardar', callback_data: 'confirm' },
+              { text: `🔄 ${newTipo === 'Salida' ? 'Entrada' : 'Salida'}`, callback_data: 'toggle_tipo' },
+              { text: '❌ Cancelar', callback_data: 'cancel' },
+            ],
+          ],
+        },
+      });
+      await ctx.answerCallbackQuery(`Tipo cambiado a: ${newTipo}`);
+      return;
+    }
+
     if (data === 'confirm') {
       try {
         await ctx.editMessageText('💾 Guardando en Google Sheets...');
 
-        const creds = await getCredentials(pending.userId);
-        if (!creds || !creds.service_account_json) {
+        const sheets = await getSheetsManager(pending.userId);
+        if (!sheets) {
           await ctx.reply('❌ No se encontraron tus credenciales. Usa /setup para configurar.');
           pendingConfirmations.delete(key);
           return;
         }
 
-        const prefs = await getPreferences(pending.userId);
-        const sheets = new SheetsManager({
-          serviceAccountJson: creds.service_account_json,
-          spreadsheetId: creds.spreadsheet_id,
-          sheetColumns: prefs?.sheet_columns || null,
-        });
-
-        const result = await sheets.appendPayment(pending.parsed, pending.tasaBs);
+        const result = await sheets.appendPayment(pending.parsed, pending.tasaBs, pending.tipo);
 
         await logPayment(pending.userId, {
           amountBs: pending.parsed.montoBolivares,
@@ -741,113 +930,77 @@ async function startBot() {
   bot.on('message:text', async (ctx) => {
     if (ctx.msg.text?.startsWith('/')) return;
 
-    const saKey = `setup:sa:${ctx.chat.id}`;
-    const sidKey = `setup:sid:${ctx.chat.id}`;
+    const text = ctx.msg.text.trim();
 
-    if (pendingConfirmations.has(saKey)) {
-      const setup = pendingConfirmations.get(saKey);
-      const text = ctx.msg.text.trim();
+    const codeMatch = text.match(/[?&]code=([^&]+)/);
+    const stateMatch = text.match(/[?&]state=([^&]+)/);
 
-      if (!text.startsWith('{')) {
+    if (codeMatch && stateMatch) {
+      const code = decodeURIComponent(codeMatch[1]);
+      const state = decodeURIComponent(stateMatch[1]);
+
+      const session = oauthPending.get(state);
+
+      if (session?._completed) {
+        const url = session._spreadsheetUrl;
         await ctx.reply(
-          '❌ Eso no parece un JSON válido. El Service Account JSON debe empezar con `{`.\n\n' +
-          'Envía el contenido completo del archivo JSON que descargaste de Google Cloud.\n\n' +
-          'O usa /cancelar para salir.',
-          { parse_mode: 'Markdown' }
+          `✅ *Ya está configurado!*\n\n` +
+          `Tu hoja ya fue creada:\n${url}\n\n` +
+          `Envía una foto de un Pago Móvil para empezar a registrar. 📸`,
+          { parse_mode: 'Markdown', disable_web_page_preview: true }
         );
         return;
       }
 
-      let parsedJson;
-      try {
-        parsedJson = JSON.parse(text);
-        if (!parsedJson.client_email || !parsedJson.private_key) {
-          throw new Error('Faltan campos requeridos (client_email, private_key)');
+      if (!session) {
+        const user = await findOrCreateUser(ctx.from?.id || ctx.chat?.id);
+        const creds = user ? await getCredentials(user.id) : null;
+        if (creds?.refresh_token || creds?.spreadsheet_id) {
+          const url = `https://docs.google.com/spreadsheets/d/${creds.spreadsheet_id}/edit`;
+          await ctx.reply(
+            `✅ *Ya tienes configuraci\u00f3n activa!*\n\n` +
+            `Tu hoja: ${url}\n\nEnv\u00eda una foto para empezar. \uD83D\uDCF8`,
+            { parse_mode: 'Markdown', disable_web_page_preview: true }
+          );
+        } else {
+          await ctx.reply('❌ Enlace expirado. Usa /setup para generar uno nuevo.');
         }
-      } catch (err) {
-        const detail = err.message.includes('Faltan')
-          ? err.message
-          : 'El JSON no es válido. Verifica que copiaste el archivo completo.';
-        await ctx.reply(`❌ ${detail}\n\nIntenta de nuevo o usa /cancelar para salir.`);
         return;
       }
 
-      await ctx.reply(
-        '✅ *Service Account configurado!*\n\n' +
-        'Paso 2: *Spreadsheet ID*\n\n' +
-        'Abre tu hoja de Google Sheets y copia el ID de la URL:\n' +
-        '`https://docs.google.com/spreadsheets/d/`**`SPREADSHEET_ID`**`/edit`\n\n' +
-        '*Importante:* La hoja debe estar compartida con:\n' +
-        `\`${parsedJson.client_email}\`\n\n` +
-        'Envía el Spreadsheet ID:',
-        { parse_mode: 'Markdown' }
-      );
-
-      pendingConfirmations.set(sidKey, {
-        userId: setup.userId,
-        serviceAccountJson: text,
-      });
-      pendingConfirmations.delete(saKey);
-      return;
-    }
-
-    if (pendingConfirmations.has(sidKey)) {
-      const setup = pendingConfirmations.get(sidKey);
-      const spreadsheetId = ctx.msg.text.trim();
-
-      if (!spreadsheetId || spreadsheetId.length < 10) {
-        await ctx.reply(
-          '❌ Ese no parece un Spreadsheet ID válido.\n\n' +
-          'El ID está en la URL de tu hoja:\n' +
-          '`https://docs.google.com/spreadsheets/d/`**`ACA_EL_ID`**`/edit`\n\n' +
-          'O usa /cancelar para salir.',
-          { parse_mode: 'Markdown' }
-        );
-        return;
-      }
-
-      const statusMsg = await ctx.reply('🔍 Probando conexión a la hoja...');
+      session._processing = true;
+      await ctx.reply('🔑 Código recibido. Configurando tu hoja de cálculo...');
 
       try {
-        const sheets = new SheetsManager({
-          serviceAccountJson: setup.serviceAccountJson,
-          spreadsheetId,
-        });
-        await sheets.init();
-
-        await saveCredentials(setup.userId, {
-          serviceAccountJson: setup.serviceAccountJson,
-          spreadsheetId,
-        });
-
+        const tokens = await exchangeCode(code, session.redirectUri);
         const defaultCols = await getDefaultSheetColumns();
-        await upsertPreferences(setup.userId, { sheetColumns: defaultCols });
 
-        await ctx.api.editMessageText(
-          ctx.chat.id,
-          statusMsg.message_id,
+        const { spreadsheetId, spreadsheetUrl } = await createSpreadsheet({
+          accessToken: tokens.access_token,
+          sheetColumns: defaultCols,
+        });
+
+        await saveOAuthTokens(session.userId, {
+          refreshToken: tokens.refresh_token,
+          scopes: tokens.scope || '',
+          spreadsheetId,
+        });
+
+        session._completed = true;
+        session._completedAt = Date.now();
+        session._spreadsheetUrl = spreadsheetUrl;
+
+        await ctx.reply(
           `✅ *Configuración completada!*\n\n` +
-          `✅ Service Account configurado\n` +
-          `✅ Spreadsheet conectado: \`${spreadsheetId}\`\n\n` +
-          `Ahora puedes enviarme capturas de Pago Móvil para registrarlas automáticamente en tu hoja. 📸`,
-          { parse_mode: 'Markdown' }
+          `📊 *Nueva hoja creada:*\n${spreadsheetUrl}\n\n` +
+          `Ya puedes enviarme capturas de Pago Móvil! 📸`,
+          { parse_mode: 'Markdown', disable_web_page_preview: true }
         );
 
-        logger.info('Usuario configuró Google Sheets', { userId: setup.userId, spreadsheetId });
+        logger.info('OAuth2 completado vía paste manual', { userId: session.userId, spreadsheetId });
       } catch (err) {
-        await ctx.api.editMessageText(
-          ctx.chat.id,
-          statusMsg.message_id,
-          `❌ *Error conectando a la hoja*\n\n${escMD(err.message)}\n\n` +
-          `Verifica que:\n` +
-          `1️⃣ El Spreadsheet ID es correcto\n` +
-          `2️⃣ La hoja está compartida con \`${JSON.parse(setup.serviceAccountJson).client_email}\`\n` +
-          `3️⃣ El Service Account tiene permisos de editor\n\n` +
-          `Usa /setup para intentar de nuevo.`,
-          { parse_mode: 'Markdown' }
-        );
-      } finally {
-        pendingConfirmations.delete(sidKey);
+        logger.error('Error procesando código OAuth pegado', { error: err.message });
+        await ctx.reply(`❌ Error: ${err.message}\n\nUsa /setup para intentar de nuevo.`);
       }
       return;
     }
@@ -859,6 +1012,20 @@ async function startBot() {
       if (pending._createdAt && (now - pending._createdAt) > 30 * 60 * 1000) {
         pendingConfirmations.delete(key);
         logger.debug(`Confirmación caducada: ${key}`);
+      }
+    }
+    for (const [id, entry] of rateLimit) {
+      if (now > entry.resetAt) rateLimit.delete(id);
+    }
+    for (const [state, session] of oauthPending) {
+      if (session._completed && session._completedAt && (now - session._completedAt) > 2 * 60 * 1000) {
+        oauthPending.delete(state);
+        continue;
+      }
+      if (session.createdAt && (now - session.createdAt) > 6 * 60 * 1000) {
+        oauthPending.delete(state);
+        logger.debug(`Sesión OAuth caducada: ${state}`);
+        session.notify?.('⏰ *Tiempo de espera agotado.* Usa /setup de nuevo para generar un nuevo enlace.', { parse_mode: 'Markdown' }).catch(() => {});
       }
     }
   }, 5 * 60 * 1000);
@@ -873,12 +1040,41 @@ async function startBot() {
     } catch { /* ok */ }
   }, 60 * 60 * 1000);
 
-  bot.catch((err) => {
-    logger.error('Bot error', { error: err.message, stack: err.stack });
-  });
+  if (config.oauth.clientId && config.oauth.clientSecret) {
+    try {
+      const authServer = await startAuthServer(config.oauth.port, oauthPending, config.telegram.token);
+      logger.info(`Servidor OAuth iniciado en puerto ${config.oauth.port}`);
 
-  process.once('SIGINT', () => bot.stop());
-  process.once('SIGTERM', () => bot.stop());
+      process.once('SIGINT', () => { authServer.close(); bot.stop(); });
+      process.once('SIGTERM', () => { authServer.close(); bot.stop(); });
+    } catch (err) {
+      logger.error('Error iniciando servidor OAuth', { error: err.message });
+    }
+  } else {
+    logger.warn([
+      '',
+      '╔══════════════════════════════════════════════════════════════════╗',
+      '║  ⚠️  OAuth2 de Google no configurado                            ║',
+      '║                                                                  ║',
+      '║  1. Ve a https://console.cloud.google.com/apis/credentials       ║',
+      '║  2. Crea un proyecto o selecciona uno existente                  ║',
+      '║  3. Habilita Google Sheets API + Google Drive API                ║',
+      '║  4. "Crear ID de cliente OAuth 2.0" → "Aplicación web"          ║',
+      '║  5. URI de redirección autorizada:                               ║',
+      '║     ' + config.oauth.redirectUri.padEnd(59) + '║',
+      '║                                                                  ║',
+      '║     ⚡ Si tu máquina NO está expuesta a internet, usa:           ║',
+      '║        http://127.0.0.1:3456/oauth/callback                      ║',
+      '║        (Google permite loopback para apps nativas)               ║',
+      '║                                                                  ║',
+      '║     📋 Si el redirect falla, el usuario puede pegar la URL       ║',
+      '║        de la barra de direcciones en el chat del bot.            ║',
+      '║                                                                  ║',
+      '║  6. Copia GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET al .env        ║',
+      '╚══════════════════════════════════════════════════════════════════╝',
+      '',
+    ].join('\n'));
+  }
 
   logger.info('Bot listo para recibir imágenes');
   await bot.start();

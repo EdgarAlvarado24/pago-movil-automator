@@ -1,41 +1,115 @@
 import { google } from 'googleapis';
 import logger from './logger.js';
 
+const SPREADSHEET_TITLE = 'Registro de Pagos Móviles';
+
 const MESES = {
   1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril',
   5: 'Mayo', 6: 'Junio', 7: 'Julio', 8: 'Agosto',
   9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre',
 };
 
+const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+const DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+
+function buildAuth(credentials) {
+  if (credentials.accessToken) {
+    const auth = new google.auth.OAuth2();
+    auth.setCredentials({ access_token: credentials.accessToken });
+    return auth;
+  }
+  if (credentials.serviceAccountJson) {
+    const creds = typeof credentials.serviceAccountJson === 'string'
+      ? JSON.parse(credentials.serviceAccountJson)
+      : credentials.serviceAccountJson;
+    return new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: [SHEETS_SCOPE, DRIVE_FILE_SCOPE],
+    });
+  }
+  throw new Error('Se requiere accessToken o serviceAccountJson');
+}
+
+export async function createSpreadsheet({ accessToken, serviceAccountJson, sheetColumns = null, title = SPREADSHEET_TITLE }) {
+  if (!accessToken && !serviceAccountJson) {
+    throw new Error('Se requiere accessToken (OAuth2) o serviceAccountJson');
+  }
+
+  const auth = buildAuth({ accessToken, serviceAccountJson });
+
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  const headerNames = sheetColumns?.columnas || ['Fecha', 'Bolivares', 'Dolares', 'Especificacion', 'Entradas/Salidas'];
+
+  logger.info('Creando nuevo spreadsheet...');
+
+  let res;
+  try {
+    res = await sheets.spreadsheets.create({
+      requestBody: {
+        properties: { title },
+        sheets: [{
+          properties: {
+            title: 'General',
+            gridProperties: { rowCount: 100, columnCount: headerNames.length },
+          },
+        }],
+      },
+    });
+  } catch (err) {
+    if (err.message?.includes('permission') || err.code === 403) {
+      throw new Error(
+        'No tengo permiso para crear hojas de cálculo.\n\n' +
+        'Para solucionarlo:\n' +
+        '1. Ve a https://console.cloud.google.com/apis/library/drive.googleapis.com\n' +
+        '2. Asegúrate de que la *Google Drive API* esté habilitada\n' +
+        '3. Espera 2-3 minutos y vuelve a intentar con /setup'
+      );
+    }
+    throw err;
+  }
+
+  const spreadsheetId = res.data.spreadsheetId;
+  logger.info(`Spreadsheet creado: ${spreadsheetId}`);
+
+  const lastCol = String.fromCharCode(64 + headerNames.length);
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `General!A1:${lastCol}1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [headerNames] },
+  });
+
+  const spreadsheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+
+  logger.info(`Encabezados escritos en hoja "General"`);
+  return { spreadsheetId, spreadsheetUrl };
+}
+
 export class SheetsManager {
-  constructor({ serviceAccountJson, spreadsheetId, sheetColumns = null }) {
-    if (!serviceAccountJson) throw new Error('serviceAccountJson es requerido');
+  constructor({ accessToken, serviceAccountJson, spreadsheetId, sheetColumns = null }) {
+    if (!accessToken && !serviceAccountJson) {
+      throw new Error('Se requiere accessToken o serviceAccountJson');
+    }
     if (!spreadsheetId) throw new Error('spreadsheetId es requerido');
 
+    this.accessToken = accessToken;
     this.serviceAccountJson = serviceAccountJson;
     this.spreadsheetId = spreadsheetId;
     this.sheetColumns = sheetColumns;
     this.initialized = false;
     this.sheets = null;
     this._existingSheets = [];
+    this._sheetIds = new Map();
   }
 
   async init() {
     if (this.initialized) return;
 
-    let credentials;
     try {
-      credentials = typeof this.serviceAccountJson === 'string'
-        ? JSON.parse(this.serviceAccountJson)
-        : this.serviceAccountJson;
-    } catch {
-      throw new Error('El Service Account JSON proporcionado no es válido.');
-    }
-
-    try {
-      const auth = new google.auth.GoogleAuth({
-        credentials,
-        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+      const auth = buildAuth({
+        accessToken: this.accessToken,
+        serviceAccountJson: this.serviceAccountJson,
       });
 
       this.sheets = google.sheets({ version: 'v4', auth });
@@ -44,6 +118,7 @@ export class SheetsManager {
         spreadsheetId: this.spreadsheetId,
       });
       this._existingSheets = res.data.sheets.map(s => s.properties.title);
+      this._sheetIds = new Map(res.data.sheets.map(s => [s.properties.title, s.properties.sheetId]));
       logger.info('Hojas disponibles en spreadsheet', { sheets: this._existingSheets.join(', '), spreadsheetId: this.spreadsheetId });
 
       this.initialized = true;
@@ -131,6 +206,7 @@ export class SheetsManager {
         spreadsheetId: this.spreadsheetId,
       });
       this._existingSheets = res.data.sheets.map(s => s.properties.title);
+      this._sheetIds = new Map(res.data.sheets.map(s => [s.properties.title, s.properties.sheetId]));
 
       if (this._existingSheets.includes(sheetName)) {
         logger.info(`Hoja "${sheetName}" ya existía (carrera)`);
@@ -139,6 +215,10 @@ export class SheetsManager {
 
       throw new Error(`Error creando hoja "${sheetName}": ${err.message}`);
     }
+  }
+
+  _getSheetId(title) {
+    return this._sheetIds.get(title) ?? 0;
   }
 
   _formatValue(field, value, context = {}) {
@@ -238,6 +318,23 @@ export class SheetsManager {
     const updatedRange = res.data.updates?.updatedRange || 'desconocido';
     logger.info(`Fila agregada en: ${updatedRange}`);
 
+    if (sheetName !== 'General' && this._existingSheets.includes('General')) {
+      try {
+        const generalSheetId = this._getSheetId('General');
+        await this.sheets.spreadsheets.batchUpdate({
+          spreadsheetId: this.spreadsheetId,
+          requestBody: {
+            requests: [{ deleteSheet: { sheetId: generalSheetId } }],
+          },
+        });
+        this._existingSheets = this._existingSheets.filter(s => s !== 'General');
+        this._sheetIds.delete('General');
+        logger.info('Hoja "General" eliminada tras primer pago');
+      } catch (deleteErr) {
+        logger.warn('No se pudo eliminar hoja "General"', { error: deleteErr.message });
+      }
+    }
+
     return {
       success: true,
       range: updatedRange,
@@ -246,7 +343,7 @@ export class SheetsManager {
     };
   }
 
-  async appendPayment(parsed, tasaBs) {
+  async appendPayment(parsed, tasaBs, tipo = 'Salida') {
     const dolares = tasaBs ? (parsed.montoBolivares / tasaBs) : null;
 
     return this.appendRow({
@@ -257,7 +354,7 @@ export class SheetsManager {
         `Ref: ${parsed.referencia || '?'}`,
         parsed.concepto || '',
       ].filter(Boolean).join(' - '),
-      tipo: 'Salida',
+      tipo,
     });
   }
 }

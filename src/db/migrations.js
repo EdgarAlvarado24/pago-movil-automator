@@ -109,6 +109,14 @@ const MIGRATIONS = [
       ON CONFLICT (telegram_id) DO NOTHING;
     `,
   },
+  {
+    name: '007_add_oauth_to_credentials',
+    sql: `
+      ALTER TABLE user_credentials
+        ADD COLUMN IF NOT EXISTS refresh_token TEXT,
+        ADD COLUMN IF NOT EXISTS token_scopes TEXT;
+    `,
+  },
 ];
 
 export async function runMigrations() {

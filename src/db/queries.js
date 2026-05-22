@@ -64,7 +64,28 @@ export async function getCredentials(userId) {
     service_account_json: cred.service_account_json
       ? decrypt(cred.service_account_json)
       : null,
+    refresh_token: cred.refresh_token
+      ? decrypt(cred.refresh_token)
+      : null,
   };
+}
+
+export async function saveOAuthTokens(userId, { refreshToken, scopes, spreadsheetId }) {
+  const encrypted = refreshToken ? encrypt(refreshToken) : null;
+
+  const { rows } = await query(
+    `INSERT INTO user_credentials (user_id, refresh_token, token_scopes, spreadsheet_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id)
+     DO UPDATE SET
+       refresh_token = COALESCE($2, user_credentials.refresh_token),
+       token_scopes = COALESCE($3, user_credentials.token_scopes),
+       spreadsheet_id = COALESCE($4, user_credentials.spreadsheet_id),
+       service_account_json = NULL
+     RETURNING *`,
+    [userId, encrypted, scopes || null, spreadsheetId || null]
+  );
+  return rows[0];
 }
 
 export async function saveCredentials(userId, { serviceAccountJson, spreadsheetId }) {
@@ -150,3 +171,20 @@ export async function getPaymentStats(userId) {
 export async function getDefaultSheetColumns() {
   return DEFAULT_SHEET_COLUMNS;
 }
+
+export async function deleteUserData(telegramId) {
+  const user = await findUserByTelegramId(telegramId);
+  if (!user) return null;
+
+  await query('DELETE FROM user_credentials WHERE user_id = $1', [user.id]);
+  await query('DELETE FROM user_preferences WHERE user_id = $1', [user.id]);
+  await query('DELETE FROM payment_log WHERE user_id = $1', [user.id]);
+
+  const { rows } = await query(
+    `UPDATE users SET whitelisted = false, is_active = false WHERE id = $1 RETURNING *`,
+    [user.id]
+  );
+  return rows[0];
+}
+
+

@@ -23,4 +23,11 @@ export const config = {
   encryption: {
     key: process.env.ENCRYPTION_KEY || '',
   },
+
+  oauth: {
+    clientId: process.env.GOOGLE_CLIENT_ID || '',
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
+    redirectUri: process.env.OAUTH_REDIRECT_URI || 'http://localhost:3456/oauth/callback',
+    port: parseInt(process.env.OAUTH_PORT, 10) || 3456,
+  },
 };
