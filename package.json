@@ -7,13 +7,21 @@
   "scripts": {
     "start": "node src/index.js",
     "bot": "node src/telegram-bot.js",
-    "test:parse": "node src/parser.js --test"
+    "test:parse": "node src/parser.js --test",
+    "migrate": "node -e \"import('./src/db/migrations.js').then(m => m.runMigrations()).then(() => process.exit(0))\"",
+    "generate-key": "node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"",
+    "logs": "tail -f logs/combined.log"
   },
   "dependencies": {
     "dotenv": "^16.4.0",
     "googleapis": "^134.0.0",
     "grammy": "^1.43.0",
     "node-fetch": "^3.3.0",
-    "tesseract.js": "^5.1.0"
+    "pg": "^8.21.0",
+    "tesseract.js": "^5.1.0",
+    "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.20.0"
   }
 }

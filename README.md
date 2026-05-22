@@ -1,67 +1,90 @@
-# Pago Móvil Automator 🎯
+# Pago Móvil Automator
 
-Automatiza el registro de tus Pagos Móviles Banesco en Google Sheets.
+Automatizador de registro de Pagos Móviles a Google Sheets. Bot de Telegram multi-tenant con PostgreSQL.
 
-## Cómo funciona
+## Arquitectura
 
-1. 📸 Tomas una captura de tu Pago Móvil Banesco
-2. 🤖 Se extraen los datos (monto, fecha, referencia, concepto)
-3. 💱 Se obtiene la tasa de cambio del día (BCV/DolarAPI)
-4. 📊 Se calcula el equivalente en dólares
-5. ✅ Revisas y confirmas
-6. 📝 Se escribe automáticamente en tu Google Sheets
-
-## Fases
-
-### Fase 1: Con OpenClaw
-Me envías la captura por chat → yo la proceso → te muestro para revisión → confirmas → escribo en Sheets.
-
-### Fase 2: Bot de Telegram independiente
-`node src/telegram-bot.js` → Bot autónomo en Telegram, no depende de mí.
-
-## Configuración
-
-### 1. Google Cloud (obligatorio)
-
-1. Ve a [Google Cloud Console](https://console.cloud.google.com/)
-2. Crea un proyecto nuevo o selecciona uno existente
-3. Ve a **APIs & Services > Library** y activa **Google Sheets API**
-4. Ve a **APIs & Services > Credentials**
-5. Crea una **Service Account**:
-   - Name: `pago-movil-automator`
-   - Role: `Editor` (o `Basic > Editor`)
-6. Al finalizar, descarga el archivo JSON con la clave privada
-7. Abre tu hoja de cálculo y compártela con el email de la service account
-   (se ve como `nombre@proyecto.iam.gserviceaccount.com`)
-
-### 2. Variables de entorno
-
-```bash
-cp .env.example .env
+```
+Usuario → Telegram Bot → PostgreSQL (users, credenciales, preferencias)
+                      → Google Sheets API (por usuario, con su propio SA)
+                      → Exchange Rate API (DolarAPI / BCV)
 ```
 
-Edita `.env`:
-- `GOOGLE_SERVICE_ACCOUNT_JSON`: Pega TODO el contenido del JSON que descargaste
-- `SPREADSHEET_ID`: Ya está configurado (el de tu hoja)
-- `SHEET_NAME`: Nombre de la pestaña (por defecto "Hoja 1")
+Cada usuario:
+- Provee su propio **Service Account JSON** de Google Cloud
+- Conecta su propio **Spreadsheet ID**
+- Puede personalizar el **formato de columnas** de su hoja
+- Datos aislados: ningún usuario ve los datos de otro
 
-### 3. Telegram bot (para Fase 2)
+## Requisitos
 
-1. Habla con [@BotFather](https://t.me/BotFather) en Telegram
-2. Crea un bot nuevo con `/newbot`
-3. Copia el token en `TELEGRAM_BOT_TOKEN` en `.env`
-4. Ejecuta `npm run bot`
+- Node.js 18+
+- PostgreSQL (recomendado: Supabase, Neon, Railway)
+- Cuenta de Google Cloud + Service Account
+- Bot de Telegram (via @BotFather)
 
-## Uso
+## Setup rápido
 
 ```bash
+# 1. Clonar e instalar
 npm install
-npm start -- --text "texto del comprobante" --confirm
+
+# 2. Generar clave de encriptación
+npm run generate-key
+
+# 3. Configurar .env (ver .env.example)
+cp .env.example .env
+
+# 4. Iniciar el bot
+npm run bot
 ```
 
-## Estructura de la hoja
+## Variables de entorno
 
-| Fecha | Bolivares | Dolares | Especificacion | Entradas/Salidas |
-|-------|-----------|---------|----------------|------------------|
-| 2026-05-13 | 1500.00 | 35.71 | Ref: 1234567890 - Pago de servicios | Salida |
-# pago-movil-automator
+| Variable | Descripción |
+|---|---|
+| `DATABASE_URL` | URL de PostgreSQL |
+| `TELEGRAM_BOT_TOKEN` | Token del bot de Telegram |
+| `ADMIN_TELEGRAM_ID` | ID de Telegram del admin |
+| `ENCRYPTION_KEY` | Clave hex de 32 bytes para encriptar SA JSONs |
+| `EXCHANGE_SOURCE` | `dolarapi` o `bcv` |
+| `EXCHANGE_MODE` | `oficial` o `paralelo` |
+
+## Comandos
+
+### Usuarios
+- `/start` — Registrar y ver estado
+- `/setup` — Configurar Google Sheets (SA JSON + Spreadsheet ID)
+- `/config` — Ver configuración actual
+- `/status` — Probar conexión a tu hoja
+- `/tasa` — Tasa de cambio del día
+- `/ultimo` — Último registro en tu hoja
+- `/mystats` — Estadísticas de tus pagos
+- `/cancelar` — Cancelar operación pendiente
+
+### Admin
+- `/whitelist add [id]` — Aprobar usuario
+- `/whitelist remove [id]` — Desaprobar usuario
+- `/listusers` — Listar todos los usuarios
+- `/removeuser [id]` — Desactivar usuario
+- `/broadcast [msg]` — Enviar mensaje a todos
+
+## Flujo de registro
+
+1. Usuario envía `/start` → se registra en DB (whitelisted=false)
+2. Admin usa `/whitelist add [telegram_id]`
+3. Usuario usa `/setup` → guía paso a paso:
+   - Envía su Service Account JSON
+   - Envía su Spreadsheet ID
+   - Bot prueba conexión y guarda
+4. Usuario envía captura de Pago Móvil → se registra en SU hoja
+
+## Scripts
+
+```bash
+npm run bot          # Iniciar bot de Telegram
+npm run migrate      # Ejecutar migraciones de DB
+npm run generate-key # Generar ENCRYPTION_KEY
+npm run test:parse   # Probar parser
+npm run logs         # Ver logs
+```

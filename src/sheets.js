@@ -1,20 +1,6 @@
-/**
- * Módulo de Google Sheets
- * Soporte multi-mes: detecta el mes de la fecha del pago y
- * escribe en la hoja correspondiente, creándola si no existe.
- *
- * Columnas: Fecha | Bolivares | Dolares | Especificacion | Entradas/Salidas
- *
- * Formato existente en la hoja:
- *   Fecha: DD/MM/AAAA
- *   Bolivares: BsX.XXX,XX (texto, con prefijo Bs)
- *   Dolares: $X,XX (texto, con prefijo $)
- */
-
 import { google } from 'googleapis';
-import { config } from './config.js';
+import logger from './logger.js';
 
-// Mapa de meses en español
 const MESES = {
   1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril',
   5: 'Mayo', 6: 'Junio', 7: 'Julio', 8: 'Agosto',
@@ -22,28 +8,28 @@ const MESES = {
 };
 
 export class SheetsManager {
-  constructor() {
+  constructor({ serviceAccountJson, spreadsheetId, sheetColumns = null }) {
+    if (!serviceAccountJson) throw new Error('serviceAccountJson es requerido');
+    if (!spreadsheetId) throw new Error('spreadsheetId es requerido');
+
+    this.serviceAccountJson = serviceAccountJson;
+    this.spreadsheetId = spreadsheetId;
+    this.sheetColumns = sheetColumns;
     this.initialized = false;
     this.sheets = null;
-    this._existingSheets = []; // cache de hojas existentes
+    this._existingSheets = [];
   }
 
-  /**
-   * Inicializa la conexión con Google Sheets
-   */
   async init() {
     if (this.initialized) return;
 
-    const { credentials, spreadsheetId } = config.google;
-
-    if (!credentials) {
-      throw new Error(
-        '❌ No hay credenciales de Google.\n' +
-        'Configura GOOGLE_SERVICE_ACCOUNT_JSON en .env'
-      );
-    }
-    if (!spreadsheetId) {
-      throw new Error('❌ SPREADSHEET_ID no configurado');
+    let credentials;
+    try {
+      credentials = typeof this.serviceAccountJson === 'string'
+        ? JSON.parse(this.serviceAccountJson)
+        : this.serviceAccountJson;
+    } catch {
+      throw new Error('El Service Account JSON proporcionado no es válido.');
     }
 
     try {
@@ -53,52 +39,64 @@ export class SheetsManager {
       });
 
       this.sheets = google.sheets({ version: 'v4', auth });
-      this.spreadsheetId = spreadsheetId;
 
-      // Cachear hojas existentes
       const res = await this.sheets.spreadsheets.get({
-        spreadsheetId,
+        spreadsheetId: this.spreadsheetId,
       });
       this._existingSheets = res.data.sheets.map(s => s.properties.title);
-      console.log('📋 Hojas disponibles:', this._existingSheets.join(', '));
+      logger.info('Hojas disponibles en spreadsheet', { sheets: this._existingSheets.join(', '), spreadsheetId: this.spreadsheetId });
 
       this.initialized = true;
-      console.log('✅ Conectado a Google Sheets:', spreadsheetId);
     } catch (err) {
-      throw new Error(`Error conectando a Google Sheets: ${err.message}`);
+      throw new Error(`Error conectando a Google Sheets: ${err.message}. Verifica que el spreadsheet existe y está compartido con el service account.`);
     }
   }
 
-  /**
-   * Obtiene el nombre de la hoja para un mes/año
-   * Ej: "Mayo 2026"
-   */
+  get columns() {
+    return this.sheetColumns?.mapping || {
+      fecha: { col: 0, formato: 'DD/MM/YYYY' },
+      bolivares: { col: 1, formato: 'Bs{{value}}' },
+      dolares: { col: 2, formato: '${{value}}' },
+      especificacion: { col: 3, formato: 'Ref: {{reference}} - {{concept}}' },
+      tipo: { col: 4, formato: '{{value}}' },
+    };
+  }
+
+  get headerNames() {
+    return this.sheetColumns?.columnas || ['Fecha', 'Bolivares', 'Dolares', 'Especificacion', 'Entradas/Salidas'];
+  }
+
+  get dataStartRow() {
+    return this.sheetColumns?.fila_inicio || 2;
+  }
+
+  get hasHeaders() {
+    return this.sheetColumns?.encabezados !== false;
+  }
+
   static getSheetNameForDate(isoDate) {
-    if (!isoDate) return config.google.sheetName;
+    if (!isoDate) return 'General';
 
     const parts = isoDate.split('-');
-    if (parts.length !== 3) return config.google.sheetName;
+    if (parts.length !== 3) return 'General';
 
     const year = parts[0];
     const month = parseInt(parts[1], 10);
     const monthName = MESES[month];
-
-    if (!monthName) return config.google.sheetName;
+    if (!monthName) return 'General';
 
     return `${monthName} ${year}`;
   }
 
-  /**
-   * Asegura que exista la hoja para un mes/año, la crea si no
-   */
   async ensureSheet(sheetName) {
     if (this._existingSheets.includes(sheetName)) {
-      return sheetName; // ya existe
+      return sheetName;
     }
 
-    console.log(`🆕 Creando hoja "${sheetName}"...`);
+    logger.info(`Creando hoja "${sheetName}"...`);
 
     try {
+      const numCols = this.headerNames.length;
       await this.sheets.spreadsheets.batchUpdate({
         spreadsheetId: this.spreadsheetId,
         requestBody: {
@@ -106,36 +104,36 @@ export class SheetsManager {
             addSheet: {
               properties: {
                 title: sheetName,
-                gridProperties: { rowCount: 100, columnCount: 5 },
+                gridProperties: { rowCount: 100, columnCount: numCols },
               },
             },
           }],
         },
       });
 
-      // Escribir encabezados
-      await this.sheets.spreadsheets.values.update({
-        spreadsheetId: this.spreadsheetId,
-        range: `${sheetName}!A1:E1`,
-        valueInputOption: 'USER_ENTERED',
-        requestBody: {
-          values: [['Fecha', 'Bolivares', 'Dolares', 'Especificacion', 'Entradas/Salidas']],
-        },
-      });
+      if (this.hasHeaders) {
+        const lastCol = String.fromCharCode(64 + numCols);
+        await this.sheets.spreadsheets.values.update({
+          spreadsheetId: this.spreadsheetId,
+          range: `${sheetName}!A1:${lastCol}1`,
+          valueInputOption: 'USER_ENTERED',
+          requestBody: {
+            values: [this.headerNames],
+          },
+        });
+      }
 
       this._existingSheets.push(sheetName);
-      console.log(`✅ Hoja "${sheetName}" creada con encabezados`);
+      logger.info(`Hoja "${sheetName}" creada con encabezados`);
       return sheetName;
     } catch (err) {
-      // Puede fallar si otro proceso la creó justo antes
-      // Refrescar cache y reintentar
       const res = await this.sheets.spreadsheets.get({
         spreadsheetId: this.spreadsheetId,
       });
       this._existingSheets = res.data.sheets.map(s => s.properties.title);
 
       if (this._existingSheets.includes(sheetName)) {
-        console.log(`✅ Hoja "${sheetName}" ya existía (carrera)`);
+        logger.info(`Hoja "${sheetName}" ya existía (carrera)`);
         return sheetName;
       }
 
@@ -143,12 +141,47 @@ export class SheetsManager {
     }
   }
 
-  /**
-   * Lee una fila específica
-   */
+  _formatValue(field, value, context = {}) {
+    if (value === null || value === undefined || value === '') return '';
+
+    const fieldConfig = this.columns[field];
+    if (!fieldConfig) return String(value);
+
+    const formatter = fieldConfig.formato || '{{value}}';
+
+    if (field === 'fecha' && value) {
+      if (/^\d{2}\/\d{2}\/\d{4}$/.test(value)) return value;
+      const parts = value.split('-');
+      if (parts.length === 3) {
+        return `${parts[2]}/${parts[1]}/${parts[0]}`;
+      }
+      return value;
+    }
+
+    if (field === 'bolivares' || field === 'dolares') {
+      const n = typeof value === 'string' ? parseFloat(value) : value;
+      if (isNaN(n)) return String(value);
+      const formatted = n.toLocaleString('es-VE', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      return formatter.replace('{{value}}', formatted);
+    }
+
+    if (field === 'especificacion') {
+      return formatter
+        .replace('{{reference}}', context.reference || '')
+        .replace('{{concept}}', context.concept || '');
+    }
+
+    return formatter.replace('{{value}}', String(value));
+  }
+
   async readRow(rowNumber, sheetName) {
-    sheetName = sheetName || config.google.sheetName;
-    const range = `${sheetName}!A${rowNumber}:E${rowNumber}`;
+    const sheet = sheetName || this._existingSheets.at(-1) || 'General';
+    const numCols = this.headerNames.length;
+    const lastCol = String.fromCharCode(64 + numCols);
+    const range = `${sheet}!A${rowNumber}:${lastCol}${rowNumber}`;
     const res = await this.sheets.spreadsheets.values.get({
       spreadsheetId: this.spreadsheetId,
       range,
@@ -156,12 +189,9 @@ export class SheetsManager {
     return res.data.values?.[0] || [];
   }
 
-  /**
-   * Obtiene la última fila con datos en una hoja
-   */
   async getLastDataRow(sheetName) {
-    sheetName = sheetName || config.google.sheetName;
-    const range = `${sheetName}!A:A`;
+    const sheet = sheetName || this._existingSheets.at(-1) || 'General';
+    const range = `${sheet}!A:A`;
     const res = await this.sheets.spreadsheets.values.get({
       spreadsheetId: this.spreadsheetId,
       range,
@@ -170,94 +200,52 @@ export class SheetsManager {
     return (res.data.values || []).length;
   }
 
-  // ========== Formateadores ==========
-
-  _formatFecha(isoDate) {
-    if (!isoDate) return '';
-    if (/^\d{2}\/\d{2}\/\d{4}$/.test(isoDate)) return isoDate;
-    const parts = isoDate.split('-');
-    if (parts.length === 3) {
-      return `${parts[2]}/${parts[1]}/${parts[0]}`;
-    }
-    return isoDate;
-  }
-
-  _formatBolivares(num) {
-    if (num === null || num === undefined || num === '') return '';
-    const n = typeof num === 'string' ? parseFloat(num) : num;
-    if (isNaN(n)) return String(num);
-    const formatted = n.toLocaleString('es-VE', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
-    return `Bs${formatted}`;
-  }
-
-  _formatDolares(num) {
-    if (num === null || num === undefined || num === '') return '';
-    const n = typeof num === 'string' ? parseFloat(num) : num;
-    if (isNaN(n)) return String(num);
-    const formatted = n.toLocaleString('es-VE', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
-    return `$${formatted}`;
-  }
-
-  // ========== Escritura ==========
-
-  /**
-   * Agrega una fila a la hoja correspondiente al mes de la fecha
-   * @param {object} data
-   * @param {string} data.fecha - Fecha en YYYY-MM-DD (de dónde saca el mes)
-   * @param {number} data.bolivares
-   * @param {number} data.dolares
-   * @param {string} data.especificacion
-   * @param {string} data.tipo - "Salida" o "Entrada"
-   */
   async appendRow({ fecha, bolivares, dolares, especificacion, tipo = 'Salida' }) {
     if (!this.initialized) await this.init();
 
-    // Determinar la hoja según la fecha
     const sheetName = SheetsManager.getSheetNameForDate(fecha);
-    console.log(`📅 Mes detectado: "${sheetName}"`);
+    logger.info(`Mes detectado: "${sheetName}"`);
 
-    // Crear la hoja si no existe
     await this.ensureSheet(sheetName);
 
-    const values = [[
-      this._formatFecha(fecha),
-      this._formatBolivares(bolivares),
-      this._formatDolares(dolares),
-      especificacion || '',
-      tipo,
-    ]];
+    const numCols = this.headerNames.length;
+    const lastCol = String.fromCharCode(64 + numCols);
 
-    console.log('📝 Escribiendo fila:', values[0]);
+    const row = new Array(numCols).fill('');
 
-    const range = `${sheetName}!A:E`;
+    const mappingContext = {
+      reference: (especificacion || '').replace(/^Ref:\s*/, '').split(' - ')[0] || '',
+      concept: (especificacion || '').split(' - ').slice(1).join(' - ') || '',
+    };
+
+    row[this.columns.fecha?.col ?? 0] = this._formatValue('fecha', fecha);
+    row[this.columns.bolivares?.col ?? 1] = this._formatValue('bolivares', bolivares);
+    row[this.columns.dolares?.col ?? 2] = this._formatValue('dolares', dolares);
+    row[this.columns.especificacion?.col ?? 3] = this._formatValue('especificacion', especificacion, mappingContext);
+    row[this.columns.tipo?.col ?? 4] = this._formatValue('tipo', tipo);
+
+    logger.info('Escribiendo fila', { row, sheetName });
+
+    const range = `${sheetName}!A:${lastCol}`;
     const res = await this.sheets.spreadsheets.values.append({
       spreadsheetId: this.spreadsheetId,
       range,
       valueInputOption: 'USER_ENTERED',
       insertDataOption: 'INSERT_ROWS',
-      requestBody: { values },
+      requestBody: { values: [row] },
     });
 
     const updatedRange = res.data.updates?.updatedRange || 'desconocido';
-    console.log(`✅ Fila agregada en: ${updatedRange}`);
+    logger.info(`Fila agregada en: ${updatedRange}`);
 
     return {
       success: true,
       range: updatedRange,
       sheetName,
-      data: values[0],
+      data: row,
     };
   }
 
-  /**
-   * Agrega una fila desde datos parseados de Pago Móvil + tasa
-   */
   async appendPayment(parsed, tasaBs) {
     const dolares = tasaBs ? (parsed.montoBolivares / tasaBs) : null;
 

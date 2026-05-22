@@ -8,6 +8,7 @@ temp/
 spa.traineddata
 *.jpg
 *.png
+logs/
 
 # === Node ===
 node_modules/
