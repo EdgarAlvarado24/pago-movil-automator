@@ -1,456 +1,599 @@
 /**
- * Parser de Pago Móvil Banesco (formato real de la app)
- * Extrae datos del texto OCR de un comprobante de la app Banesco
+ * Parser multi-banco de Pago Móvil Venezolano
  *
- * Formato real (app Banesco):
- *
- *   Recibo
- *   ¡Operación Exitosa!
- *   En breve le llegará un SMS con el resultado de la operación.
- *
- *   NÚMERO DE REFERENCIA
- *   061308215588
- *
- *   FECHA
- *   10/05/2026 12:34:23PM
- *
- *   NÚMERO CELULAR DE ORIGEN
- *   04**-***5068
- *
- *   NÚMERO CELULAR DE DESTINO
- *   0424-5813136
- *
- *   IDENTIFICACIÓN RECEPTOR
- *   V-12340600
- *
- *   BANCO EMISOR
- *   BANESCO BANCO UNIVERSAL S.A.C.A.
- *
- *   BANCO RECEPTOR
- *   BANCO PROVINCIAL
- *
- *   MONTO DE LA OPERACIÓN
- *   Bs. 6.300,00
- *
- *   CONCEPTO
- *   pago
+ * Formatos reales soportados:
+ *   - Banesco (app clásica + confirmación simple)
+ *   - Mercantil Tpago
+ *   - Banco de Venezuela / PagomóvilBDV
+ *   - BBVA Provincial / Dinero Rápido
+ *   - 100% Banco
+ *   - Mercantil, BNC, Bancaribe, Exterior, etc.
  */
 
+// ============================================================
+// REGISTRO DE BANCOS
+// ============================================================
+
+const BANKS = [
+  { id: 'banesco',    names: ['banesco', 'banesco banco universal'],
+    label: 'Banesco',  emoji: '🏦' },
+  { id: 'mercantil',  names: ['mercantil banco universal', 'mercantil', 'tpago'],
+    label: 'Mercantil', emoji: '🏦' },
+  { id: 'bdv',        names: ['pagomóvilbdv', 'pagomovilbdv', 'bdv', 'bdvapp', 'banco de venezuela'],
+    label: 'Banco de Venezuela', emoji: '🏛️' },
+  { id: '100banco',   names: ['100% banco', '100% pago móvil'],
+    label: '100% Banco', emoji: '💯' },
+  { id: 'provincial', names: ['bbva provincial', 'banco provincial', 'provincial', 'dinero rápido', 'dinero rapido'],
+    label: 'BBVA Provincial', emoji: '🏛️' },
+  { id: 'bnc',        names: ['bnc', 'banco nacional de crédito'],
+    label: 'BNC', emoji: '🏛️' },
+  { id: 'exterior',   names: ['banco exterior'],
+    label: 'Banco Exterior', emoji: '🌎' },
+  { id: 'bancaribe',  names: ['bancaribe', 'banco bancaribe'],
+    label: 'Bancaribe', emoji: '🏦' },
+  { id: 'tesoro',     names: ['banco del tesoro'],
+    label: 'Banco del Tesoro', emoji: '🏛️' },
+  { id: 'venezolano', names: ['venezolano de crédito', 'banco venezolano de crédito'],
+    label: 'Banco Venezolano de Crédito', emoji: '🏦' },
+  { id: 'banplus',    names: ['banplus'],
+    label: 'Banplus', emoji: '🏦' },
+  { id: 'bod',        names: ['bod', 'banco occidental de descuento'],
+    label: 'BOD', emoji: '🏛️' },
+];
+
+// ============================================================
+// LABELS POR CAMPO (ordenados por prioridad)
+// ============================================================
+
+const LABEL_PATTERNS = {
+  REFERENCIA: [
+    /^N[ÚU]MERO\s+DE\s+REFERENCIA/i,
+    /^N[RO°º]\.?\s*(?:DE\s+)?REFERENCIA/i,
+    /^N[ÚU]MERO\s+DE\s+OPERACI[OÓ]N/i,
+    /^REFERENCIA/i,
+    /^TRANSACCI[OÓ]N/i,
+    /^OPERACI[OÓ]N/i,
+    /^REF\b/i,
+  ],
+  MONTO: [
+    /^MONTO\s+\(BS\.?\)/i,
+    /^MONTO\s+EN\s+BOL[IÍ]VARES/i,
+    /^MONTO\s+(DE\s+LA\s+)?OPERACI[OÓ]N/i,
+    /^MONTO\b/i,
+    /^TOTAL\b/i,
+  ],
+  FECHA: [
+    /^FECHA\s+(Y\s+HORA\s+DEL\s+ENV[IÍ]O)?/i,
+  ],
+  TELEFONO_ORIGEN: [
+    /^N[ÚU]MERO\s+CELULAR\s+(DE\s+)?ORIGEN/i,
+    /^TEL[EÉ]FONO\s+ORIGEN/i,
+    /^TEL[EÉ]FONO\s+CELULAR/i,
+    /^ORIGEN\b/i,
+    /^PAGADOR\b/i,
+    /^N[ÚU]MERO\s+ORIGEN/i,
+  ],
+  TELEFONO_DESTINO: [
+    /^N[ÚU]MERO\s+CELULAR\s+(DE\s+)?DESTINO/i,
+    /^TEL[EÉ]FONO\s+DESTINO/i,
+    /^DESTINO\b/i,
+    /^BENEFICIARIO\b/i,
+    /^N[ÚU]MERO\s+CELULAR\b/i,
+    /^N[ÚU]MERO\s+CELULAR$/i,
+  ],
+  BANCO_RECEPTOR: [
+    /^BANCO\s+DESTINO/i,
+    /^BANCO\s+RECEPTOR/i,
+    /^BANCO\b/i,
+  ],
+  CONCEPTO: [
+    /^CONCEPTO/i,
+  ],
+  IDENTIFICACION: [
+    /^IDENTIFICACI[OÓ]N\s+RECEPTOR/i,
+    /^C[ÉE]DULA\s+BENEFICIARIO/i,
+    /^C[ÉE]DULA\s+DE\s+IDENTIDAD/i,
+    /^DOCUMENTO\s+DE\s+IDENTIDAD/i,
+    /^IDENTIFICACI[OÓ]N\b/i,
+    /^C[ÉE]DULA\b/i,
+  ],
+  NOMBRE: [
+    /^NOMBRE\b/i,
+  ],
+  CUENTA_ORIGEN: [
+    /^CUENTA\s+ORIGEN/i,
+    /^CUENTA\s+PAGADORA/i,
+  ],
+};
+
+const UI_LABELS = [
+  /^(aceptar|listo|ok|confirmar|cancelar|volver|salir|continuar|atrás|atras)/i,
+  /^(agregar\s+(a\s+)?pagos?\s+(frecuentes)?)/i,
+  /^[Ee][)\]]\s*agregar/i,
+  /^(compartir|enviar|imprimir|descargar)/i,
+  /^(recibo|operaci[oó]n\s+exitosa|pago\s+realizado\s+exitosamente)/i,
+  /^(el\s+dinero\s+fue\s+enviado)/i,
+  /^(tu\s+\w+\s+fue\s+exitoso)/i,
+  /^(comprobante\s+de\s+operaci[oó]n)/i,
+  /^(crear\s+acceso\s+directo)/i,
+  /^(volver\s+al\s+monedero)/i,
+];
+
+// ============================================================
+// CLASE PRINCIPAL
+// ============================================================
+
 export class PagoMovilParser {
-  /**
-   * Parsea el texto OCR de un comprobante de Pago Móvil Banesco
-   * @param {string} rawText - Texto extraído de la imagen vía OCR
-   * @returns {object|null} Datos parseados o null si no se reconoce
-   */
+
   static parse(rawText) {
-    if (!rawText || typeof rawText !== 'string') {
-      return null;
-    }
+    if (!rawText || typeof rawText !== 'string') return null;
+    let text = rawText.trim();
+    if (!this._isMobilePayment(text)) return null;
 
-    const text = rawText.trim();
+    const bancoDetectado = this._detectBank(text);
+    const lines = text.split('\n')
+      .map(l => l.trim())
+      .filter(l => l.length > 2 && !this._isUI(l));
 
-    // Verificar que sea un Pago Móvil Banesco
-    if (!this._isMobilePayment(text)) {
-      return null;
-    }
+    const fecha = this._extractDate(lines);
+    const montoBolivares = this._extractAmount(lines);
+    const referencia = this._extractReference(lines);
+    const concepto = this._extractConcept(lines);
+    const pagador = this._extractPhone('ORIGEN', lines);
+    const beneficiario = this._extractPhone('DESTINO', lines) || this._extractGenericPhone(lines);
+    const bancoReceptor = this._extractBankReceptor(lines);
+    const bancoEmisor = bancoDetectado?.nombre || null;
+    const receptorId = this._extractId(lines);
+    const nombreReceptor = this._extractName(lines);
+    const cuentaOrigen = this._extractCuenta(lines);
 
-    const result = {
-      fecha: this._extractDate(text),
-      montoBolivares: this._extractAmount(text),
-      referencia: this._extractReference(text),
-      concepto: this._extractConcept(text),
-      pagador: this._extractOriginPhone(text),
-      beneficiario: this._extractDestPhone(text),
-      bancoEmisor: this._extractIssuingBank(text),
-      bancoReceptor: this._extractReceivingBank(text),
-      receptorId: this._extractReceptorId(text),
+    return {
+      banco: bancoDetectado?.id || 'desconocido',
+      fecha, montoBolivares, referencia, concepto,
+      pagador, beneficiario,
+      bancoEmisor, bancoReceptor,
+      receptorId, nombreReceptor, cuentaOrigen,
       raw: text,
     };
-
-    return result;
   }
 
-  /**
-   * Valida que los datos mínimos estén presentes
-   */
   static validate(parsed) {
-    if (!parsed) return { valid: false, errors: ['No se reconoce como Pago Móvil Banesco'] };
-
+    if (!parsed) return { valid: false, errors: ['No se reconoce como Pago Móvil'] };
     const errors = [];
-
     if (!parsed.fecha) errors.push('No se pudo extraer la fecha');
     if (parsed.montoBolivares === null || parsed.montoBolivares === undefined) errors.push('No se pudo extraer el monto');
     if (!parsed.referencia) errors.push('No se pudo extraer el número de referencia');
+    return { valid: errors.length === 0, errors, data: parsed };
+  }
 
-    return {
-      valid: errors.length === 0,
-      errors,
-      data: parsed,
-    };
+  // ================================================================
+  // BANK DETECTION
+  // ================================================================
+
+  static _detectBank(text) {
+    const lines = text.split('\n').filter(l => l.trim().length > 0);
+    const header = lines.slice(0, 6).join('\n').toLowerCase();
+    const lower = text.toLowerCase();
+
+    // Prioridad 1: cabecera — gana el que aparece MÁS TEMPRANO
+    let best = null;
+    let bestPos = Infinity;
+    for (const bank of BANKS) {
+      for (const name of bank.names) {
+        const pos = header.indexOf(name.toLowerCase());
+        if (pos !== -1 && pos < bestPos) { bestPos = pos; best = bank; }
+      }
+    }
+    if (best) return { id: best.id, nombre: best.label, emoji: best.emoji };
+
+    // Prioridad 2: todo el texto — preferir match más largo
+    let bestLen = 0;
+    for (const bank of BANKS) {
+      for (const name of bank.names) {
+        if (lower.includes(name) && name.length > bestLen) { bestLen = name.length; best = bank; }
+      }
+    }
+    return best ? { id: best.id, nombre: best.label, emoji: best.emoji } : null;
   }
 
   static _isMobilePayment(text) {
-    const keywords = [
-      'operación exitosa', 'operacion exitosa',
-      'recibo', 'pago móvil', 'pago movil',
-      'banesco', 'monto de la operación', 'monto de la operacion',
-    ];
     const lower = text.toLowerCase();
-    // Buscar Banesco + al menos otra palabra clave
-    const hasBanesco = lower.includes('banesco');
-    const hasOtherKeyword = keywords.some(k => lower.includes(k));
-    return hasBanesco || hasOtherKeyword;
-  }
-
-  // Labels conocidos del formato Banesco (en orden de aparición típico)
-  static KNOWN_LABELS = [
-    'NÚMERO DE REFERENCIA',
-    'FECHA',
-    'NÚMERO CELULAR DE ORIGEN',
-    'NÚMERO CELULAR DE DESTINO',
-    'IDENTIFICACIÓN RECEPTOR',
-    'IDENTIFICACION RECEPTOR',
-    'BANCO EMISOR',
-    'BANCO RECEPTOR',
-    'MONTO DE LA OPERACIÓN',
-    'MONTO DE LA OPERACION',
-    'CONCEPTO',
-    'REFERENCIA',
-    'MONTO',
-    'PAGADOR',
-    'BENEFICIARIO',
-    'CEDULA',
-    'CÉDULA',
-    'BANCO',
-    'COMISIÓN',
-    'COMISION',
-    'TOTAL',
-    'Pago Móvil',
-    'Pago Movil',
-    'Operación Exitosa',
-    'Operacion Exitosa',
-    'Recibo',
-    'Agregar a Pagos Frecuentes',
-    'Agregar a Pagos',
-    'Aceptar',
-    'E) Agregar a Pagos Frecuentes',
-    'E) Agregar a Pagos',
-  ];
-
-  /**
-   * Normaliza una línea: elimina espacios extra, estandariza
-   */
-  static _normalizeLine(line) {
-    return line.replace(/\s+/g, ' ').trim();
-  }
-
-  /**
-   * Verifica si una línea es un label conocido de Banesco
-   */
-  static _isKnownLabel(line) {
-    const nLine = this._normalizeLine(line).toUpperCase();
-    // Quitar signos de puntuación para comparar
-    const cleanLine = nLine.replace(/[^A-ZÁÉÍÓÚÑ0-9\s]/g, '').trim();
-    return this.KNOWN_LABELS.some(label => {
-      const cleanLabel = label.toUpperCase().replace(/[^A-ZÁÉÍÓÚÑ0-9\s]/g, '').trim();
-      return cleanLine === cleanLabel;
-    });
-  }
-
-  /**
-   * Extrae texto entre un label y el siguiente label conocido
-   */
-  static _extractFieldAfterLabel(text, labelRegex, multiline = false) {
-    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-
-    for (let i = 0; i < lines.length; i++) {
-      if (labelRegex.test(lines[i])) {
-        const valueLines = [];
-        for (let j = i + 1; j < lines.length; j++) {
-          const line = lines[j];
-          // Si es otro label conocido o texto vacío, parar
-          if (this._isKnownLabel(line)) break;
-          if (!multiline) {
-            return line;
-          }
-          valueLines.push(line);
-        }
-        if (multiline) {
-          return valueLines.join(' ').trim() || null;
-        }
-      }
-    }
-    return null;
-  }
-
-  static _extractDate(text) {
-    // Formato: FECHA\n10/05/2026 12:34:23PM
-    // o FECHA\n10/05/2026
-    const dateVal = this._extractFieldAfterLabel(text, /^FECHA$/i);
-    if (dateVal) {
-      // Extraer solo la fecha (DD/MM/AAAA)
-      const match = dateVal.match(/(\d{1,2}\/\d{1,2}\/\d{2,4})/);
-      if (match) {
-        let [day, month, year] = match[1].split('/');
-        if (year.length === 2) year = '20' + year;
-        return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
-      }
-    }
-
-    // Fallback: buscar cualquier fecha en el texto
-    const match = text.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
-    if (match) {
-      let [_, day, month, year] = match;
-      if (year.length === 2) year = '20' + year;
-      return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
-    }
-
-    return null;
-  }
-
-  static _extractAmount(text) {
-    // MONTO DE LA OPERACIÓN\nBs. 6.300,00
-    const amountLine = this._extractFieldAfterLabel(text, /^MONTO\s+(DE\s+LA\s+)?OPERACIÓN/i);
-
-    if (amountLine) {
-      const match = amountLine.match(/(?:Bs\.?\s*)?([\d.,]+)/);
-      if (match) {
-        return this._parseVenezuelanNumber(match[1]);
-      }
-    }
-
-    // Fallback: buscar Bs. X.XXX,XX en todo el texto
-    const match = text.match(/(?:Bs\.?\s*)([\d.,]+)/);
-    if (match) {
-      return this._parseVenezuelanNumber(match[1]);
-    }
-
-    return null;
-  }
-
-  static _extractReference(text) {
-    // NÚMERO DE REFERENCIA\n061308215588
-    const ref = this._extractFieldAfterLabel(text, /^NÚMERO\s+(DE\s+)?REFERENCIA/i);
-    if (ref) {
-      const match = ref.match(/(\d{6,})/);
-      if (match) return match[1];
-    }
-
-    // Fallback
-    const match = text.match(/(\d{10,15})/);
-    return match ? match[1] : null;
-  }
-
-  static _extractConcept(text) {
-    // CONCEPTO\npago
-    // CONCEPTO\nPago de servicios
-    const concept = this._extractFieldAfterLabel(text, /^CONCEPTO$/i, true);
-    if (concept) return this._cleanConcept(concept);
-
-    // Fallback: después de MONTO, buscar texto que no parezca label
-    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    for (let i = 0; i < lines.length; i++) {
-      if (/^CONCEPTO$/i.test(lines[i])) {
-        for (let j = i + 1; j < lines.length; j++) {
-          const line = lines[j];
-          // Si es un label conocido, parar
-          if (this._looksLikeLabel(line) || /^(aceptar|agregar|ok|listo)/i.test(line)) {
-            break;
-          }
-          // Si es texto normal (no label)
-          if (!this._looksLikeLabel(line) && line.length > 0) {
-            return line.trim();
-          }
-        }
-      }
-    }
-
-    // Último recurso: buscar "CONCEPTO" seguido de texto
-    const match = text.match(/CONCEPTO\s*\n+([^\n]+)/i);
-    if (match) {
-      return this._cleanConcept(match[1].trim());
-    }
-
-    return null;
-  }
-
-  /**
-   * Limpia el concepto: elimina texto de UI/OCR que se cuela
-   * Ej: "pago E) Agregar a Pagos Frecuentes" → "pago"
-   */
-  static _cleanConcept(rawConcept) {
-    if (!rawConcept) return null;
-
-    let concept = rawConcept.trim();
-
-    // Eliminar cualquier texto después de UI markers
-    const uiMarkers = [
-      /[Ee][)][\s]*agregar/i,
-      /agregar\s+a\s+pagos/i,
-      /aceptar/i,
-      /listo/i,
-      /ok/i,
+    let count = 0;
+    const signals = [
+      'pago móvil', 'pago movil', 'pagomóvil', 'pagomovil',
+      'tpago', 'operación exitosa', 'operacion exitosa',
+      'pago realizado exitosamente',
+      'monto de la operación', 'número de referencia',
+      'nro. de referencia', 'comprobante de operación',
+      'el dinero fue enviado', 'dinero rápido', 'dinero rapido',
+      'banesco', 'mercantil', 'provincial', 'bbva',
+      'banco de venezuela', 'bdv', '100% banco',
     ];
+    for (const s of signals) { if (lower.includes(s)) count++; }
+    return count >= 2 || (count >= 1 && (lower.includes('bs.') || lower.includes('referencia')));
+  }
 
-    for (const marker of uiMarkers) {
-      const idx = concept.search(marker);
-      if (idx > 0) {
-        concept = concept.substring(0, idx).trim();
+  // ================================================================
+  // MATCHER
+  // ================================================================
+
+  static _matchLabel(lines, patterns) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      for (const pattern of patterns) {
+        const match = line.match(pattern);
+        if (!match) continue;
+
+        const afterLabel = line.slice(match[0].length).trim();
+
+        // Caso 1: "Label: valor"
+        const colonMatch = afterLabel.match(/^:\s*(.+)/);
+        if (colonMatch) { const v = colonMatch[1].trim(); if (v && !this._isUI(v)) return v; }
+
+        // Caso 2: "Label valor" sin colon en misma línea
+        if (afterLabel && afterLabel.length > 1 && !afterLabel.startsWith(':')) {
+          const lower = afterLabel.toLowerCase();
+          // Rechazar si parece título/header de app
+          const isTitle = /pago\s*m[oó]vil|pagom[oó]vil|operaci[oó]n\s*exitosa|comprobante/.test(lower);
+          if (!isTitle && !this._looksLikeLabel(afterLabel) && !this._isUI(afterLabel)) {
+            return afterLabel;
+          }
+        }
+
+        // Caso 3: Label\nValor en siguiente línea
+        for (let j = i + 1; j < lines.length; j++) {
+          const next = lines[j].trim();
+          if (!next || this._looksLikeLabel(next)) break;
+          if (this._isUI(next)) break;
+          return next;
+        }
+        continue; // probar otro patrón en esta línea
       }
     }
-
-    return concept.length > 0 ? concept : null;
+    return null;
   }
 
-  static _extractOriginPhone(text) {
-    // NÚMERO CELULAR DE ORIGEN\n04**-***5068
-    const phone = this._extractFieldAfterLabel(text, /^NÚMERO\s+CELULAR\s+(DE\s+)?ORIGEN/i);
-    return phone || null;
+  static _looksLikeLabel(line) {
+    if (line.endsWith(':')) return true;
+    for (const group of Object.values(LABEL_PATTERNS)) {
+      for (const pat of group) { if (pat.test(line)) return true; }
+    }
+    return false;
   }
 
-  static _extractDestPhone(text) {
-    // NÚMERO CELULAR DE DESTINO\n0424-5813136
-    const phone = this._extractFieldAfterLabel(text, /^NÚMERO\s+CELULAR\s+(DE\s+)?DESTINO/i);
-    return phone || null;
+  static _isUI(text) {
+    return UI_LABELS.some(p => p.test(text.trim()));
   }
 
-  static _extractIssuingBank(text) {
-    // BANCO EMISOR\nBANESCO BANCO UNIVERSAL S.A.C.A.
-    const bank = this._extractFieldAfterLabel(text, /^BANCO\s+EMISOR/i);
-    return bank || null;
+  // ================================================================
+  // EXTRACTORES
+  // ================================================================
+
+  static _extractDate(lines) {
+    let val = this._matchLabel(lines, LABEL_PATTERNS.FECHA);
+    if (val) {
+      const m = val.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})/);
+      if (m) return this._fmtDate(m);
+    }
+    for (const l of lines) {
+      const m = l.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})/);
+      if (m) return this._fmtDate(m);
+    }
+    return null;
   }
 
-  static _extractReceivingBank(text) {
-    // BANCO RECEPTOR\nBANCO PROVINCIAL
-    const bank = this._extractFieldAfterLabel(text, /^BANCO\s+RECEPTOR/i);
-    return bank || null;
+  static _fmtDate(m) {
+    let [, d, mo, y] = m;
+    if (y.length === 2) y = '20' + y;
+    return `${y}-${mo.padStart(2, '0')}-${d.padStart(2, '0')}`;
   }
 
-  static _extractReceptorId(text) {
-    // IDENTIFICACIÓN RECEPTOR\nV-12340600
-    const id = this._extractFieldAfterLabel(text, /^IDENTIFICACIÓN\s+RECEPTOR/i);
-    return id || null;
+  static _extractAmount(lines) {
+    const val = this._matchLabel(lines, LABEL_PATTERNS.MONTO);
+    if (val) { const m = val.match(/(?:Bs\.?\s*)?([\d.,]+)/); if (m) return this._parseVEN(m[1]); }
+    for (const l of lines) {
+      const m = l.match(/(?:Bs\.?\s*)([\d.,]+)/);
+      if (m) return this._parseVEN(m[1]);
+    }
+    for (const l of lines) {
+      if (/^\d{1,3}(?:\.\d{3})*,\d{2}$/.test(l)) return this._parseVEN(l);
+    }
+    return null;
   }
 
-  /**
-   * Convierte número en formato venezolano (6.300,00) a float
-   */
-  static _parseVenezuelanNumber(str) {
+  static _extractReference(lines) {
+    const val = this._matchLabel(lines, LABEL_PATTERNS.REFERENCIA);
+    if (val) {
+      const t = val.trim();
+      if (/^\d{4,15}$/.test(t)) return t;
+      const m = t.match(/(\d{6,15})/); if (m) return m[1];
+    }
+    for (const l of lines) {
+      const m = l.match(/\b([1-9]\d{5,14})\b/);
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  static _extractConcept(lines) {
+    const c = this._matchLabel(lines, LABEL_PATTERNS.CONCEPTO);
+    if (c) return this._cleanConcept(c);
+    for (let i = 0; i < lines.length; i++) {
+      if (/^CONCEPTO/i.test(lines[i])) {
+        const p = []; for (let j = i + 1; j < lines.length; j++) {
+          if (this._looksLikeLabel(lines[j])) break; p.push(lines[j]);
+        }
+        if (p.length) return this._cleanConcept(p.join(' '));
+      }
+    }
+    return null;
+  }
+
+  static _cleanConcept(r) {
+    if (!r) return null;
+    let c = r.trim();
+    for (const m of [/[Ee][)\]]?\s*agregar/i, /agregar\s+a\s+pagos/i, /aceptar/i, /listo/i, /ok/i]) {
+      const idx = c.search(m); if (idx > 0) c = c.substring(0, idx).trim();
+    }
+    return c.length ? c : null;
+  }
+
+  static _extractPhone(type, lines) {
+    const key = type === 'ORIGEN' ? 'TELEFONO_ORIGEN' : 'TELEFONO_DESTINO';
+    const val = this._matchLabel(lines, LABEL_PATTERNS[key]);
+    if (val) { const m = val.match(/(0\d{2,3})-?(\d{3,7})/); if (m) return `${m[1]}${m[2]}`; }
+    return null;
+  }
+
+  static _extractGenericPhone(lines) {
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i].toLowerCase();
+      if (l.includes('beneficiario') || l.includes('celular') || l.includes('teléfono') || l.includes('telefono')) {
+        let m = lines[i].match(/(0(?:4\d{2}|2\d{2}))-?(\d{3,7})/);
+        if (m) return `${m[1]}${m[2]}`;
+        if (i + 1 < lines.length) {
+          const ml = lines[i+1].match(/(0(?:4\d{2}|2\d{2}))-?(\d{3,7})/);
+          if (ml && lines[i+1].length < 15) return `${ml[1]}${ml[2]}`;
+        }
+      }
+    }
+    for (const l of lines) {
+      const m = l.trim().match(/^(0(?:4\d{2}|2\d{2}))-?(\d{3,7})$/);
+      if (m) return `${m[1]}${m[2]}`;
+    }
+    return null;
+  }
+
+  static _extractBankReceptor(lines) {
+    const val = this._matchLabel(lines, LABEL_PATTERNS.BANCO_RECEPTOR);
+    if (val) return val.replace(/^\d{4}\s*-\s*/, '').trim();
+    return null;
+  }
+
+  static _extractId(lines) {
+    const val = this._matchLabel(lines, LABEL_PATTERNS.IDENTIFICACION);
+    if (val) {
+      const clean = val.replace(/^([VEJPGvejpg])[:,\s]+/, '$1');
+      const m = clean.match(/[VEJPGvejpg]-?[\d.]+/);
+      if (m) return m[0].replace(/\./g, '');
+      if (/\d{6,}/.test(val)) return val.match(/\d{6,}/)[0];
+    }
+    const full = lines.join('\n');
+    const m = full.match(/[VEJPGvejpg]-?\d{5,10}/);
+    return m ? m[0].replace(/\./g, '') : null;
+  }
+
+  static _extractName(lines) { return this._matchLabel(lines, LABEL_PATTERNS.NOMBRE); }
+  static _extractCuenta(lines) { return this._matchLabel(lines, LABEL_PATTERNS.CUENTA_ORIGEN); }
+
+  // ================================================================
+  // NÚMEROS
+  // ================================================================
+
+  static _parseVEN(str) {
     if (!str) return null;
     let s = str.trim();
-
-    // Si tiene coma decimal (formato venezolano)
-    if (s.includes(',')) {
-      s = s.replace(/\./g, '');  // quitar puntos de miles
-      s = s.replace(',', '.');   // coma → punto decimal
-    } else if (s.includes('.') && (s.match(/\./g) || []).length > 1) {
-      // Múltiples puntos = formato venezolano sin coma (ej: "1.500")
-      s = s.replace(/\./g, '');
-    }
-
+    const hasComma = s.includes(',');
+    const hasDot = s.includes('.');
+    if (hasComma && hasDot) {
+      if (s.indexOf(',') < s.indexOf('.')) { s = s.replace(/,/g, ''); }
+      else { s = s.replace(/\./g, ''); s = s.replace(',', '.'); }
+    } else if (hasComma) { s = s.replace(',', '.'); }
+    else if (hasDot && (s.match(/\./g) || []).length > 1) { s = s.replace(/\./g, ''); }
     return parseFloat(s);
   }
 
-  /**
-   * Formatea datos parseados para mostrar en revisión
-   */
+  // ================================================================
+  // FORMATO REVISIÓN
+  // ================================================================
+
   static formatForReview(parsed, tasaBs) {
     if (!parsed) return '❌ No se pudieron extraer datos del comprobante.';
-
-    const montoDolares = tasaBs ? (parsed.montoBolivares / tasaBs).toFixed(2) : 'N/A';
-
+    const montoD = tasaBs ? (parsed.montoBolivares / tasaBs).toFixed(2) : 'N/A';
+    const banco = BANKS.find(b => b.id === parsed.banco);
+    const hdr = banco ? `${banco.emoji} *Banco:* ${banco.label}` : '';
     return [
-      '📋 **Datos extraídos del Pago Móvil**',
-      '',
-      `📅 **Fecha:** ${parsed.fecha || '❓ No detectada'}`,
+      '📋 **Datos extraídos del Pago Móvil**', hdr, '',
+      `📅 **Fecha:** ${parsed.fecha || '❓'}`,
       `💰 **Monto:** Bs. ${parsed.montoBolivares?.toFixed(2) || '❓'}`,
-      `💵 **En dólares:** $${montoDolares} (tasa: Bs. ${tasaBs?.toFixed(2) || 'N/A'})`,
-      `🔢 **Referencia:** ${parsed.referencia || '❓ No detectada'}`,
+      `💵 **En dólares:** $${montoD} (tasa: Bs. ${tasaBs?.toFixed(2) || 'N/A'})`,
+      `🔢 **Referencia:** ${parsed.referencia || '❓'}`,
       `📝 **Concepto:** ${parsed.concepto || '(sin concepto)'}`,
-      `📱 **Origen:** ${parsed.pagador || '❓'}`,
+      `📱 **Origen:** ${parsed.pagador || parsed.cuentaOrigen || '❓'}`,
       `📱 **Destino:** ${parsed.beneficiario || '❓'}`,
+      parsed.nombreReceptor ? `👤 **Receptor:** ${parsed.nombreReceptor}` : null,
+      `🆔 **Cédula:** ${parsed.receptorId || '❓'}`,
       `🏦 **Banco emisor:** ${parsed.bancoEmisor || '❓'}`,
       `🏦 **Banco receptor:** ${parsed.bancoReceptor || '❓'}`,
-    ].join('\n');
+    ].filter(Boolean).join('\n');
   }
 }
 
-// === Pruebas inline ===
-function runTests() {
-  const sampleText = `
-Recibo
-¡Operación Exitosa!
-En breve le llegará un SMS con el resultado de la operación.
+// ================================================================
+// PRUEBAS
+// ================================================================
 
+function runTests() {
+  let pass = 0, fail = 0;
+  const t = (name, fn) => { try { fn(); pass++; console.log(`  ✅ ${name}`); } catch (e) { fail++; console.log(`  ❌ ${name}: ${e.message}`); }};
+  const a = (cond, msg) => { if (!cond) throw new Error(msg || 'Assertion'); };
+
+  console.log('\n🧪 === PRUEBAS ===\n');
+
+  // 1. BANESCO clásico
+  console.log('\n📌 BANESCO (clásico)');
+  const b1 = `Recibo
+¡Operación Exitosa!
 NÚMERO DE REFERENCIA
 061308215588
-
 FECHA
 10/05/2026 12:34:23PM
-
 NÚMERO CELULAR DE ORIGEN
 04**-***5068
-
 NÚMERO CELULAR DE DESTINO
 0424-5813136
-
 IDENTIFICACIÓN RECEPTOR
 V-12340600
-
 BANCO EMISOR
 BANESCO BANCO UNIVERSAL S.A.C.A.
-
 BANCO RECEPTOR
 BANCO PROVINCIAL
-
 MONTO DE LA OPERACIÓN
 Bs. 6.300,00
-
 CONCEPTO
-pago
-  `.trim();
+pago`.trim();
+  t('detecta Banesco', () => { const d = PagoMovilParser._detectBank(b1); a(d?.id === 'banesco'); });
+  t('parsea Banesco', () => {
+    const p = PagoMovilParser.parse(b1);
+    a(p.fecha === '2026-05-10'); a(p.montoBolivares === 6300); a(p.referencia === '061308215588'); a(p.concepto === 'pago');
+  });
+  t('validación', () => a(PagoMovilParser.validate(PagoMovilParser.parse(b1)).valid));
 
-  console.log('=== Test 1: Parseo formato app Banesco ===');
-  const parsed = PagoMovilParser.parse(sampleText);
-  console.log(JSON.stringify(parsed, null, 2));
+  // 2. TPAGO (Mercantil)
+  console.log('\n📌 TPAGO (Mercantil)');
+  const t2 = `¡Listo!
+Tu Tpago fue exitoso
+Monto (Bs.):
+2.543,00
+Nro. de referencia:
+40227643
+Fecha y hora del envío:
+13/05/2026 a las 3:40:29 PM
+Cuenta origen:
+Cta. Ahorro *6127
+Beneficiario:
+0414-5145068
+Documento de identidad:
+V-24.527.534
+Banco destino:
+0134 - Banesco Banco Universal S.a.c.a.
+Concepto:
+yogurt`.trim();
+  t('detecta Mercantil (tpago)', () => a(PagoMovilParser._detectBank(t2)?.id === 'mercantil'));
+  t('parsea Tpago', () => {
+    const p = PagoMovilParser.parse(t2);
+    a(p.fecha === '2026-05-13'); a(p.montoBolivares === 2543); a(p.referencia === '40227643');
+    a(p.beneficiario === '04145145068'); a(p.concepto === 'yogurt');
+    a(['V24527534', 'V-24527534'].includes(p.receptorId));
+  });
 
-  console.log('\n=== Test 2: Validación ===');
-  const validation = PagoMovilParser.validate(parsed);
-  console.log('Válido:', validation.valid);
-  if (!validation.valid) console.log('Errores:', validation.errors);
+  // 3. BDV / PagomóvilBDV
+  console.log('\n📌 BDV');
+  const b3 = `Comprobante de operación
+PagomóvilBDV Personas
+Fecha: 17/05/2026
+Operación: 006059869247
+Identificación: 24527534
+Origen: 0102****4024
+Destino: 04145145068
+Banco: 0134 - BANESCO
+Concepto: pago`.trim();
+  t('detecta BDV', () => a(PagoMovilParser._detectBank(b3)?.id === 'bdv'));
 
-  console.log('\n=== Test 3: Formato para revisión ===');
-  console.log(PagoMovilParser.formatForReview(parsed, 508.60));
+  // 4. 100% BANCO
+  console.log('\n📌 100% BANCO');
+  const c1 = `Transacción 100% Pago Móvil
+PAGO REALIZADO EXITOSAMENTE
+Transacción 10238
+Fecha 15-04-2026 04:25:09 p.m
+Cuenta Pagadora
+0156****10201913269
+Nombre
+Edgar Alvarado
+Cedula Beneficiario V:24527534
+Teléfono Celular
+04145145068
+Banco Destino MERCANTIL
+Concepto pago
+Monto en Bolivares Bs.6,222.00
+Tasa de Cambio Bs.478.58`.trim();
+  t('detecta 100% Banco', () => a(PagoMovilParser._detectBank(c1)?.id === '100banco'));
+  t('parsea 100% Banco', () => {
+    const p = PagoMovilParser.parse(c1);
+    a(p.fecha === '2026-04-15'); a(p.montoBolivares === 6222); a(p.referencia === '10238');
+    a(p.beneficiario === '04145145068'); a(p.concepto === 'pago');
+    a(['V24527534', 'V-24527534'].includes(p.receptorId));
+    a(p.bancoReceptor?.toLowerCase().includes('mercantil'));
+    a(p.nombreReceptor === 'Edgar Alvarado');
+  });
 
-  console.log('\n=== Test 4: No es Pago Móvil ===');
-  const notPayment = PagoMovilParser.parse('Factura de electricidad...');
-  console.log('Resultado:', notPayment);
+  // 5. DINERO RÁPIDO (BBVA Provincial)
+  console.log('\n📌 DINERO RÁPIDO (Provincial)');
+  const d1 = `MARIA MARITZA LINARES
+El dinero fue enviado
+Bs.2.414,00
+E Dinero Rápido
+Banco: BANESCO
+Número celular: 04145145068
+Identificación: V24527534
+Concepto: Pago
+Fecha: 22/04/2026
+Referencia 000005739`.trim();
+  t('detecta Provincial', () => a(PagoMovilParser._detectBank(d1)?.id === 'provincial'));
+  t('parsea Dinero Rápido', () => {
+    const p = PagoMovilParser.parse(d1);
+    a(p.fecha === '2026-04-22'); a(p.montoBolivares === 2414); a(p.referencia === '000005739');
+    a(p.concepto === 'Pago'); a(p.beneficiario === '04145145068');
+    a(p.bancoReceptor?.toLowerCase().includes('banesco'));
+  });
 
-  console.log('\n=== Test 5: Concepto multi-línea ===');
-  const multiConcept = `
-Recibo
-¡Operación Exitosa!
+  // 6. BANESCO simple
+  console.log('\n📌 BANESCO (confirmación)');
+  const s1 = `JOSE GERMAN CAMACHO VALERO
+El dinero fue enviado
+Banco: BANESCO
+Número celular: 04145145068
+Identificación: V24527534
+Concepto: Pago
+Fecha: 08/05/2026
+Referencia: 000005695`.trim();
+  t('detecta Banesco (fallback)', () => a(PagoMovilParser._detectBank(s1)?.id === 'banesco'));
+  t('parsea Banesco simple', () => {
+    const p = PagoMovilParser.parse(s1);
+    a(p.fecha === '2026-05-08'); a(p.referencia === '000005695');
+    a(['V24527534', 'V-24527534'].includes(p.receptorId));
+  });
 
-NÚMERO DE REFERENCIA
-1234567890
+  // 7. NO PAGO MÓVIL
+  console.log('\n📌 NO ES PAGO MÓVIL');
+  t('USDT rechazado', () => a(PagoMovilParser.parse('Payment Successful\nPaid With USDT') === null));
+  t('factura rechazada', () => a(PagoMovilParser.parse('Factura de electricidad') === null));
+  t('texto vacío', () => a(PagoMovilParser.parse('') === null));
+  t('null', () => a(PagoMovilParser.parse(null) === null));
 
-FECHA
-13/05/2026 04:30:00PM
+  // 8. _parseVEN
+  console.log('\n📌 _parseVEN');
+  t('6.300,00', () => a(PagoMovilParser._parseVEN('6.300,00') === 6300));
+  t('6,222.00 (intl)', () => a(PagoMovilParser._parseVEN('6,222.00') === 6222));
+  t('2.543,00', () => a(PagoMovilParser._parseVEN('2.543,00') === 2543));
+  t('500,00', () => a(PagoMovilParser._parseVEN('500,00') === 500));
 
-MONTO DE LA OPERACIÓN
-Bs. 1.200,00
-
-CONCEPTO
-Pago de servicios
-profesionales
-  `.trim();
-  const parsed2 = PagoMovilParser.parse(multiConcept);
-  console.log('Concepto:', parsed2?.concepto);
-
-  const allPassed = validation.valid && parsed !== null && notPayment === null;
-  console.log('\n' + (allPassed ? '✅ Todas las pruebas pasaron' : '❌ Fallaron pruebas'));
+  // RESULTADO
+  const total = pass + fail;
+  console.log(`\n${'='.repeat(50)}`);
+  console.log(`📊 ${pass}/${total} pruebas pasaron`);
+  if (fail > 0) { console.log(`❌ ${fail} fallaron`); process.exit(1); }
+  else console.log('✅ Todas las pruebas pasaron');
 }
 
-if (process.argv[1] && (process.argv[1].includes('parser') || process.argv.includes('--test'))) {
-  runTests();
-}
+if (process.argv[1] && (process.argv[1].includes('parser') || process.argv.includes('--test'))) { runTests(); }
