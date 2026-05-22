@@ -117,6 +117,13 @@ const MIGRATIONS = [
         ADD COLUMN IF NOT EXISTS token_scopes TEXT;
     `,
   },
+  {
+    name: '008_drop_service_account_json',
+    sql: `
+      ALTER TABLE user_credentials
+        DROP COLUMN IF EXISTS service_account_json;
+    `,
+  },
 ];
 
 export async function runMigrations() {

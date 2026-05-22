@@ -140,7 +140,7 @@ async function startBot() {
 
   async function requireCredentials(ctx, user) {
     const creds = await getCredentials(user.id);
-    const hasAuth = creds?.refresh_token || creds?.service_account_json;
+    const hasAuth = creds?.refresh_token;
     if (!hasAuth || !creds?.spreadsheet_id) {
       await ctx.reply(
         '⚠️ *Configuración pendiente*\n\n' +
@@ -159,25 +159,14 @@ async function startBot() {
     if (!creds || !creds.spreadsheet_id) return null;
 
     const prefs = await getPreferences(userId);
+    if (!creds.refresh_token) return null;
 
-    if (creds.refresh_token) {
-      const accessToken = await refreshAccessTokenIfNeeded(creds.refresh_token);
-      return new SheetsManager({
-        accessToken,
-        spreadsheetId: creds.spreadsheet_id,
-        sheetColumns: prefs?.sheet_columns || null,
-      });
-    }
-
-    if (creds.service_account_json) {
-      return new SheetsManager({
-        serviceAccountJson: creds.service_account_json,
-        spreadsheetId: creds.spreadsheet_id,
-        sheetColumns: prefs?.sheet_columns || null,
-      });
-    }
-
-    return null;
+    const accessToken = await refreshAccessTokenIfNeeded(creds.refresh_token);
+    return new SheetsManager({
+      accessToken,
+      spreadsheetId: creds.spreadsheet_id,
+      sheetColumns: prefs?.sheet_columns || null,
+    });
   }
 
   bot.command('start', async (ctx) => {
@@ -231,7 +220,7 @@ async function startBot() {
     if (!user) return;
 
     const creds = await getCredentials(user.id);
-    if (creds?.refresh_token || creds?.service_account_json) {
+    if (creds?.refresh_token) {
       await ctx.reply(
         '⚠️ *Ya tienes Google Sheets configurado.*\n\n' +
         'Si quieres reconectar con una cuenta diferente:\n' +
@@ -303,9 +292,7 @@ async function startBot() {
 
     const authMethod = creds?.refresh_token
       ? '✅ OAuth2 (Google)'
-      : creds?.service_account_json
-        ? '⚠️ Service Account (legacy)'
-        : '❌ No configurado';
+      : '❌ No configurado';
 
     const lines = [
       '📋 *Tu configuración*\n',

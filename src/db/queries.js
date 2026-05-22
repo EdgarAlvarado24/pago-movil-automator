@@ -61,9 +61,6 @@ export async function getCredentials(userId) {
   const cred = rows[0];
   return {
     ...cred,
-    service_account_json: cred.service_account_json
-      ? decrypt(cred.service_account_json)
-      : null,
     refresh_token: cred.refresh_token
       ? decrypt(cred.refresh_token)
       : null,
@@ -80,25 +77,9 @@ export async function saveOAuthTokens(userId, { refreshToken, scopes, spreadshee
      DO UPDATE SET
        refresh_token = COALESCE($2, user_credentials.refresh_token),
        token_scopes = COALESCE($3, user_credentials.token_scopes),
-       spreadsheet_id = COALESCE($4, user_credentials.spreadsheet_id),
-       service_account_json = NULL
+       spreadsheet_id = COALESCE($4, user_credentials.spreadsheet_id)
      RETURNING *`,
     [userId, encrypted, scopes || null, spreadsheetId || null]
-  );
-  return rows[0];
-}
-
-export async function saveCredentials(userId, { serviceAccountJson, spreadsheetId }) {
-  const encrypted = serviceAccountJson ? encrypt(serviceAccountJson) : null;
-
-  const { rows } = await query(
-    `INSERT INTO user_credentials (user_id, service_account_json, spreadsheet_id)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (user_id)
-     DO UPDATE SET service_account_json = COALESCE($2, user_credentials.service_account_json),
-                   spreadsheet_id = COALESCE($3, user_credentials.spreadsheet_id)
-     RETURNING *`,
-    [userId, encrypted, spreadsheetId || null]
   );
   return rows[0];
 }

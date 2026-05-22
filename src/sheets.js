@@ -12,30 +12,18 @@ const MESES = {
 const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 const DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 
-function buildAuth(credentials) {
-  if (credentials.accessToken) {
-    const auth = new google.auth.OAuth2();
-    auth.setCredentials({ access_token: credentials.accessToken });
-    return auth;
-  }
-  if (credentials.serviceAccountJson) {
-    const creds = typeof credentials.serviceAccountJson === 'string'
-      ? JSON.parse(credentials.serviceAccountJson)
-      : credentials.serviceAccountJson;
-    return new google.auth.GoogleAuth({
-      credentials: creds,
-      scopes: [SHEETS_SCOPE, DRIVE_FILE_SCOPE],
-    });
-  }
-  throw new Error('Se requiere accessToken o serviceAccountJson');
+function buildAuth(accessToken) {
+  const auth = new google.auth.OAuth2();
+  auth.setCredentials({ access_token: accessToken });
+  return auth;
 }
 
-export async function createSpreadsheet({ accessToken, serviceAccountJson, sheetColumns = null, title = SPREADSHEET_TITLE }) {
-  if (!accessToken && !serviceAccountJson) {
-    throw new Error('Se requiere accessToken (OAuth2) o serviceAccountJson');
+export async function createSpreadsheet({ accessToken, sheetColumns = null, title = SPREADSHEET_TITLE }) {
+  if (!accessToken) {
+    throw new Error('Se requiere accessToken de OAuth2');
   }
 
-  const auth = buildAuth({ accessToken, serviceAccountJson });
+  const auth = buildAuth(accessToken);
 
   const sheets = google.sheets({ version: 'v4', auth });
 
@@ -87,14 +75,11 @@ export async function createSpreadsheet({ accessToken, serviceAccountJson, sheet
 }
 
 export class SheetsManager {
-  constructor({ accessToken, serviceAccountJson, spreadsheetId, sheetColumns = null }) {
-    if (!accessToken && !serviceAccountJson) {
-      throw new Error('Se requiere accessToken o serviceAccountJson');
-    }
+  constructor({ accessToken, spreadsheetId, sheetColumns = null }) {
+    if (!accessToken) throw new Error('Se requiere accessToken de OAuth2');
     if (!spreadsheetId) throw new Error('spreadsheetId es requerido');
 
     this.accessToken = accessToken;
-    this.serviceAccountJson = serviceAccountJson;
     this.spreadsheetId = spreadsheetId;
     this.sheetColumns = sheetColumns;
     this.initialized = false;
@@ -107,10 +92,7 @@ export class SheetsManager {
     if (this.initialized) return;
 
     try {
-      const auth = buildAuth({
-        accessToken: this.accessToken,
-        serviceAccountJson: this.serviceAccountJson,
-      });
+      const auth = buildAuth(this.accessToken);
 
       this.sheets = google.sheets({ version: 'v4', auth });
 

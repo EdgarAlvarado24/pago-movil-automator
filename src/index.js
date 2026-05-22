@@ -3,40 +3,27 @@
 import { PagoMovilParser } from './parser.js';
 import { getExchangeRate } from './exchange-rate.js';
 import { SheetsManager } from './sheets.js';
+import { getAccessToken } from './oauth.js';
 import logger from './logger.js';
 
 export async function processPayment(rawText, options = {}) {
   const {
     autoConfirm = false,
-    serviceAccountJson = null,
+    accessToken = null,
     spreadsheetId = null,
     sheetColumns = null,
   } = options;
-
-  if (!serviceAccountJson || !spreadsheetId) {
-    return {
-      success: false,
-      step: 'config',
-      errors: ['Se requiere serviceAccountJson y spreadsheetId para multi-tenant'],
-    };
-  }
 
   const parsed = PagoMovilParser.parse(rawText);
   const validation = PagoMovilParser.validate(parsed);
 
   if (!validation.valid) {
-    return {
-      success: false,
-      step: 'parse',
-      errors: validation.errors,
-      rawText,
-    };
+    return { success: false, step: 'parse', errors: validation.errors, rawText };
   }
 
   let tasaBs = null;
-  let tasaInfo = null;
   try {
-    tasaInfo = await getExchangeRate(parsed.fecha);
+    const tasaInfo = await getExchangeRate(parsed.fecha);
     tasaBs = tasaInfo.rate;
   } catch (err) {
     logger.warn('No se pudo obtener tasa', { error: err.message });
@@ -60,46 +47,26 @@ export async function processPayment(rawText, options = {}) {
   console.log('='.repeat(50));
 
   if (autoConfirm) {
-    const sheets = new SheetsManager({
-      serviceAccountJson,
-      spreadsheetId,
-      sheetColumns,
-    });
+    if (!accessToken || !spreadsheetId) {
+      return { success: false, step: 'config', errors: ['Se requiere accessToken y spreadsheetId'] };
+    }
+    const sheets = new SheetsManager({ accessToken, spreadsheetId, sheetColumns });
     await sheets.init();
     const result = await sheets.appendPayment(parsed, tasaBs);
-    return {
-      success: true,
-      step: 'saved',
-      preview,
-      result,
-    };
+    return { success: true, step: 'saved', preview, result };
   }
 
-  return {
-    success: true,
-    step: 'preview',
-    preview,
-    confirmationRequired: true,
-  };
+  return { success: true, step: 'preview', preview, confirmationRequired: true };
 }
 
 if (process.argv[1]?.includes('index.js') || process.argv[1]?.includes('pago-movil-automator')) {
   const args = process.argv.slice(2);
   const textFlag = args.indexOf('--text');
   const confirmFlag = args.includes('--confirm');
-  const saFlag = args.indexOf('--sa');
-  const ssFlag = args.indexOf('--spreadsheet');
 
   if (textFlag !== -1 && args[textFlag + 1]) {
     const rawText = args[textFlag + 1];
-    const serviceAccountJson = saFlag !== -1 ? args[saFlag + 1] : process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-    const spreadsheetId = ssFlag !== -1 ? args[ssFlag + 1] : process.env.SPREADSHEET_ID;
-
-    processPayment(rawText, {
-      autoConfirm: confirmFlag,
-      serviceAccountJson,
-      spreadsheetId,
-    })
+    processPayment(rawText, { autoConfirm: confirmFlag })
       .then(result => {
         if (result.success && result.step === 'saved') {
           console.log('\n✅ Registro guardado en Google Sheets!');
@@ -115,7 +82,7 @@ if (process.argv[1]?.includes('index.js') || process.argv[1]?.includes('pago-mov
     console.log('Uso: node src/index.js --text "texto OCR aqui" [--confirm]');
     console.log('  --text          Texto extraído del comprobante');
     console.log('  --confirm       Guardar automáticamente sin confirmación');
-    console.log('  --sa            Service Account JSON (opcional, usa env var)');
-    console.log('  --spreadsheet   Spreadsheet ID (opcional, usa env var)');
+    console.log('');
+    console.log('Nota: Para guardar en Google Sheets usa el bot de Telegram (npm run bot)');
   }
 }
