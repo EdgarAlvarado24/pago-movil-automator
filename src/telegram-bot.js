@@ -435,8 +435,9 @@ async function startBot() {
   bot.command('cancelar', async (ctx) => {
     const confirmKey = `confirm:${ctx.chat.id}`;
     const choiceKey = `setup:choice:${ctx.chat.id}`;
+    const awaitingKey = `awaiting_sid:${ctx.chat.id}`;
 
-    const anyKey = [confirmKey, choiceKey].find(k => pendingConfirmations.has(k));
+    const anyKey = [confirmKey, choiceKey, awaitingKey].find(k => pendingConfirmations.has(k));
     if (anyKey) {
       pendingConfirmations.delete(anyKey);
       await ctx.reply('✅ Operación cancelada.');
@@ -796,6 +797,87 @@ async function startBot() {
       return;
     }
 
+    if (data.startsWith('oauth_new_')) {
+      const state = data.slice(10);
+      const session = oauthPending.get(state);
+      if (!session || !session._tokens) {
+        await ctx.editMessageText('❌ Sesión expirada. Usa /setup de nuevo.');
+        await ctx.answerCallbackQuery('Error');
+        return;
+      }
+
+      await ctx.editMessageText('✨ Creando hoja de cálculo...');
+
+      try {
+        const defaultCols = await getDefaultSheetColumns();
+        const { spreadsheetId, spreadsheetUrl } = await createSpreadsheet({
+          accessToken: session._tokens.access_token,
+          sheetColumns: defaultCols,
+        });
+
+        await saveOAuthTokens(session.userId, {
+          refreshToken: session._tokens.refresh_token,
+          scopes: session._tokens.scope || '',
+          spreadsheetId,
+        });
+
+        session._completed = true;
+        session._completedAt = Date.now();
+        session._spreadsheetUrl = spreadsheetUrl;
+
+        await ctx.reply(
+          `✅ *Configuración completada!*\n\n` +
+          `📊 *Nueva hoja creada:*\n${spreadsheetUrl}\n\n` +
+          `Ya puedes enviarme capturas de Pago Móvil! 📸`,
+          { parse_mode: 'Markdown', disable_web_page_preview: true }
+        );
+
+        logger.info('Hoja creada vía OAuth callback', { userId: session.userId, spreadsheetId });
+        await ctx.answerCallbackQuery('✅ Hoja creada');
+      } catch (err) {
+        logger.error('Error creando hoja', { error: err.message });
+        await ctx.reply(`❌ Error creando hoja: ${err.message}\n\nUsa /setup de nuevo.`);
+        await ctx.answerCallbackQuery('Error');
+      }
+      return;
+    }
+
+    if (data.startsWith('oauth_existing_')) {
+      const state = data.slice(15);
+      logger.debug('Buscando sesión oauth_existing', {
+        state,
+        stateLen: state.length,
+        pendingSize: oauthPending.size,
+        pendingStates: [...oauthPending.keys()].join(','),
+        found: oauthPending.has(state),
+      });
+      let session = oauthPending.get(state);
+      if (!session || !session._tokens) {
+        session = [...oauthPending.values()].find(s => s.chatId === chatId && s._tokens);
+        if (!session) {
+          await ctx.editMessageText('❌ Sesión expirada. Usa /setup de nuevo.');
+          await ctx.answerCallbackQuery('Error');
+          return;
+        }
+      }
+
+      pendingConfirmations.set(`awaiting_sid:${chatId}`, {
+        userId: session.userId,
+        tokens: session._tokens,
+        state,
+      });
+
+      await ctx.editMessageText(
+        '🔗 *Usar hoja existente*\n\n' +
+        'Abre tu hoja de Google Sheets y copia el ID de la URL:\n' +
+        '`https://docs.google.com/spreadsheets/d/`**`SPREADSHEET_ID`**`/edit`\n\n' +
+        'Envía el ID:',
+        { parse_mode: 'Markdown' }
+      );
+      await ctx.answerCallbackQuery('Usar existente');
+      return;
+    }
+
     if (data === 'remove_cancel') {
       await ctx.editMessageText('✅ Operación cancelada. Tus datos están a salvo.');
       await ctx.answerCallbackQuery('Cancelado');
@@ -956,38 +1038,95 @@ async function startBot() {
       }
 
       session._processing = true;
-      await ctx.reply('🔑 Código recibido. Configurando tu hoja de cálculo...');
+      await ctx.reply('🔑 Código recibido. Guardando acceso...');
 
       try {
         const tokens = await exchangeCode(code, session.redirectUri);
-        const defaultCols = await getDefaultSheetColumns();
 
-        const { spreadsheetId, spreadsheetUrl } = await createSpreadsheet({
-          accessToken: tokens.access_token,
-          sheetColumns: defaultCols,
-        });
-
-        await saveOAuthTokens(session.userId, {
-          refreshToken: tokens.refresh_token,
-          scopes: tokens.scope || '',
-          spreadsheetId,
-        });
-
-        session._completed = true;
-        session._completedAt = Date.now();
-        session._spreadsheetUrl = spreadsheetUrl;
+        session._tokens = tokens;
+        session._tokensSavedAt = Date.now();
 
         await ctx.reply(
-          `✅ *Configuración completada!*\n\n` +
-          `📊 *Nueva hoja creada:*\n${spreadsheetUrl}\n\n` +
-          `Ya puedes enviarme capturas de Pago Móvil! 📸`,
-          { parse_mode: 'Markdown', disable_web_page_preview: true }
+          '✅ *Autorización de Google recibida!*\n\n¿Qué hoja de cálculo quieres usar?',
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '✨ Crear hoja nueva', callback_data: `oauth_new_${state}` },
+                  { text: '🔗 Usar existente', callback_data: `oauth_existing_${state}` },
+                ],
+              ],
+            },
+          }
         );
 
-        logger.info('OAuth2 completado vía paste manual', { userId: session.userId, spreadsheetId });
+        logger.info('Tokens guardados vía paste, esperando elección de hoja', { userId: session.userId });
       } catch (err) {
         logger.error('Error procesando código OAuth pegado', { error: err.message });
         await ctx.reply(`❌ Error: ${err.message}\n\nUsa /setup para intentar de nuevo.`);
+      }
+      return;
+    }
+
+    const awaitingKey = `awaiting_sid:${ctx.chat.id}`;
+    if (pendingConfirmations.has(awaitingKey)) {
+      const pending = pendingConfirmations.get(awaitingKey);
+      const spreadsheetId = text.trim();
+
+      if (!spreadsheetId || spreadsheetId.length < 10 || spreadsheetId.includes(' ')) {
+        await ctx.reply(
+          '❌ Ese no parece un ID válido.\n\n' +
+          'El ID está en la URL de tu hoja:\n' +
+          '`https://docs.google.com/spreadsheets/d/`**`ACA_EL_ID`**`/edit`\n\n' +
+          'O usa /cancelar para salir.',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const statusMsg = await ctx.reply('🔍 Verificando hoja...');
+
+      try {
+        const sheets = new SheetsManager({
+          accessToken: await refreshAccessTokenIfNeeded(pending.tokens.refresh_token),
+          spreadsheetId,
+        });
+        await sheets.init();
+
+        await saveOAuthTokens(pending.userId, {
+          refreshToken: pending.tokens.refresh_token,
+          scopes: pending.tokens.scope || '',
+          spreadsheetId,
+        });
+
+        const session = oauthPending.get(pending.state);
+        if (session) {
+          session._completed = true;
+          session._completedAt = Date.now();
+          session._spreadsheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+        }
+
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          statusMsg.message_id,
+          `✅ *Configuración completada!*\n\n` +
+          `📊 Hoja conectada: \`${spreadsheetId}\`\n\n` +
+          `Ya puedes enviarme capturas de Pago Móvil! 📸`,
+          { parse_mode: 'Markdown' }
+        );
+
+        logger.info('Hoja existente vinculada', { userId: pending.userId, spreadsheetId });
+      } catch (err) {
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          statusMsg.message_id,
+          `❌ *Error*\n\n${escMD(err.message)}\n\n` +
+          `Verifica que el ID es correcto y que la hoja existe. Usa /cancelar para salir.`,
+          { parse_mode: 'Markdown' }
+        );
+      } finally {
+        pendingConfirmations.delete(awaitingKey);
       }
       return;
     }
