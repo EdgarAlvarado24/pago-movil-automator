@@ -105,7 +105,7 @@ export class SheetsManager {
 
       this.initialized = true;
     } catch (err) {
-      throw new Error(`Error conectando a Google Sheets: ${err.message}. Verifica que el spreadsheet existe y está compartido con el service account.`);
+      throw new Error(`Error conectando a Google Sheets: ${err.message}. Verifica que el spreadsheet existe y tienes acceso con tu cuenta de Google.`);
     }
   }
 
@@ -181,6 +181,17 @@ export class SheetsManager {
       }
 
       this._existingSheets.push(sheetName);
+      try {
+        const updated = await this.sheets.spreadsheets.get({
+          spreadsheetId: this.spreadsheetId,
+          ranges: [sheetName],
+          fields: 'sheets.properties(sheetId,title)',
+        });
+        const newSheet = updated.data.sheets?.[0];
+        if (newSheet?.properties) {
+          this._sheetIds.set(newSheet.properties.title, newSheet.properties.sheetId);
+        }
+      } catch { /* non-critical, fallback al ID 0 */ }
       logger.info(`Hoja "${sheetName}" creada con encabezados`);
       return sheetName;
     } catch (err) {
@@ -200,7 +211,7 @@ export class SheetsManager {
   }
 
   _getSheetId(title) {
-    return this._sheetIds.get(title) ?? 0;
+    return this._sheetIds.get(title) ?? null;
   }
 
   _formatValue(field, value, context = {}) {
@@ -209,7 +220,7 @@ export class SheetsManager {
     const fieldConfig = this.columns[field];
     if (!fieldConfig) return String(value);
 
-    const formatter = fieldConfig.formato || '{{value}}';
+    let formatter = fieldConfig.formato || '{{value}}';
 
     if (field === 'fecha' && value) {
       if (/^\d{2}\/\d{2}\/\d{4}$/.test(value)) return value;
@@ -230,13 +241,11 @@ export class SheetsManager {
       return formatter.replace('{{value}}', formatted);
     }
 
-    if (field === 'especificacion') {
-      return formatter
-        .replace('{{reference}}', context.reference || '')
-        .replace('{{concept}}', context.concept || '');
+    formatter = formatter.replace('{{value}}', String(value ?? ''));
+    for (const [key, val] of Object.entries(context)) {
+      formatter = formatter.replaceAll(`{{${key}}}`, val ?? '');
     }
-
-    return formatter.replace('{{value}}', String(value));
+    return formatter;
   }
 
   async readRow(rowNumber, sheetName) {
@@ -262,7 +271,7 @@ export class SheetsManager {
     return (res.data.values || []).length;
   }
 
-  async appendRow({ fecha, bolivares, dolares, especificacion, tipo = 'Salida' }) {
+  async appendRow({ fecha, bolivares, dolares, especificacion, tipo = 'Salida' }, parsedData = null) {
     if (!this.initialized) await this.init();
 
     const sheetName = SheetsManager.getSheetNameForDate(fecha);
@@ -275,16 +284,26 @@ export class SheetsManager {
 
     const row = new Array(numCols).fill('');
 
-    const mappingContext = {
-      reference: (especificacion || '').replace(/^Ref:\s*/, '').split(' - ')[0] || '',
-      concept: (especificacion || '').split(' - ').slice(1).join(' - ') || '',
+    const ctx = {
+      reference: parsedData?.referencia || (especificacion || '').replace(/^Ref:\s*/, '').split(' - ')[0] || '',
+      concept: parsedData?.concepto || (especificacion || '').split(' - ').slice(1).join(' - ') || '',
+      pagador: parsedData?.pagador || '',
+      beneficiario: parsedData?.beneficiario || '',
+      bancoEmisor: parsedData?.bancoEmisor || parsedData?.banco || '',
+      bancoReceptor: parsedData?.bancoReceptor || '',
+      receptorId: parsedData?.receptorId || '',
+      nombreReceptor: parsedData?.nombreReceptor || '',
+      cuentaOrigen: parsedData?.cuentaOrigen || '',
     };
 
-    row[this.columns.fecha?.col ?? 0] = this._formatValue('fecha', fecha);
-    row[this.columns.bolivares?.col ?? 1] = this._formatValue('bolivares', bolivares);
-    row[this.columns.dolares?.col ?? 2] = this._formatValue('dolares', dolares);
-    row[this.columns.especificacion?.col ?? 3] = this._formatValue('especificacion', especificacion, mappingContext);
-    row[this.columns.tipo?.col ?? 4] = this._formatValue('tipo', tipo);
+    const fieldValues = { fecha, bolivares, dolares, especificacion, tipo };
+
+    for (const [fieldName, config] of Object.entries(this.columns)) {
+      const colIdx = config.col;
+      if (colIdx === undefined || colIdx < 0 || colIdx >= numCols) continue;
+      const val = fieldValues[fieldName] !== undefined ? fieldValues[fieldName] : ctx[fieldName] ?? null;
+      row[colIdx] = this._formatValue(fieldName, val, ctx);
+    }
 
     logger.info('Escribiendo fila', { row, sheetName });
 
@@ -301,19 +320,23 @@ export class SheetsManager {
     logger.info(`Fila agregada en: ${updatedRange}`);
 
     if (sheetName !== 'General' && this._existingSheets.includes('General')) {
-      try {
-        const generalSheetId = this._getSheetId('General');
-        await this.sheets.spreadsheets.batchUpdate({
-          spreadsheetId: this.spreadsheetId,
-          requestBody: {
-            requests: [{ deleteSheet: { sheetId: generalSheetId } }],
-          },
-        });
-        this._existingSheets = this._existingSheets.filter(s => s !== 'General');
-        this._sheetIds.delete('General');
-        logger.info('Hoja "General" eliminada tras primer pago');
-      } catch (deleteErr) {
-        logger.warn('No se pudo eliminar hoja "General"', { error: deleteErr.message });
+      const generalSheetId = this._getSheetId('General');
+      if (generalSheetId !== null) {
+        try {
+          await this.sheets.spreadsheets.batchUpdate({
+            spreadsheetId: this.spreadsheetId,
+            requestBody: {
+              requests: [{ deleteSheet: { sheetId: generalSheetId } }],
+            },
+          });
+          this._existingSheets = this._existingSheets.filter(s => s !== 'General');
+          this._sheetIds.delete('General');
+          logger.info('Hoja "General" eliminada tras primer pago');
+        } catch (deleteErr) {
+          logger.warn('No se pudo eliminar hoja "General"', { error: deleteErr.message });
+        }
+      } else {
+        logger.warn('No se encontró el ID de la hoja "General", se omite eliminación');
       }
     }
 
@@ -337,6 +360,6 @@ export class SheetsManager {
         parsed.concepto || '',
       ].filter(Boolean).join(' - '),
       tipo,
-    });
+    }, parsed);
   }
 }

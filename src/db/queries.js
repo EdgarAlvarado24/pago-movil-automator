@@ -103,6 +103,12 @@ const DEFAULT_SHEET_COLUMNS = {
   },
   fila_inicio: 2,
   encabezados: true,
+  campos_disponibles: [
+    'fecha', 'bolivares', 'dolares', 'especificacion', 'tipo',
+    'referencia', 'concepto', 'pagador', 'beneficiario',
+    'bancoEmisor', 'bancoReceptor', 'receptorId',
+    'nombreReceptor', 'cuentaOrigen',
+  ],
 };
 
 export async function upsertPreferences(userId, prefs = {}) {

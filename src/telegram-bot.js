@@ -169,6 +169,32 @@ async function startBot() {
     });
   }
 
+  async function _showFormatSummary(ctx, chatId, state) {
+    const summary = state.columns.map((c, i) => {
+      const choice = FORMAT_FIELD_CHOICES.find(f => f.field === c.field);
+      const label = choice?.label || c.field || '?';
+      const tmpl = c.template ? ` (${c.template})` : '';
+      return `${i + 1}. "${c.name}" → ${label}${tmpl}`;
+    }).join('\n');
+
+    pendingConfirmations.set(`format:save:${chatId}`, state);
+    await ctx.reply(
+      `📐 *Resumen del formato*\n\n${summary}\n\n` +
+      `¿Guardar este formato?`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Guardar', callback_data: 'format_save' },
+              { text: '❌ Cancelar', callback_data: 'format_cancel' },
+            ],
+          ],
+        },
+      }
+    );
+  }
+
   bot.command('start', async (ctx) => {
     const telegramId = ctx.from?.id || ctx.chat?.id;
     const user = await ensureUser(ctx);
@@ -206,6 +232,7 @@ async function startBot() {
       'Comandos:\n' +
       '/setup — Configurar tu Google Sheets\n' +
       '/config — Ver tu configuración actual\n' +
+      '/format — Personalizar columnas de tu hoja\n' +
       '/status — Probar conexión a tu hoja\n' +
       '/tasa — Ver la tasa de cambio del día\n' +
       '/ultimo — Ver tu último registro\n' +
@@ -312,10 +339,58 @@ async function startBot() {
       }
     }
 
-    lines.push('', 'Para cambiar la configuración, usa /setup');
+    lines.push('', 'Para cambiar el formato, usa /format');
+
+    if (prefs?.sheet_columns?.campos_disponibles) {
+      lines.push('', '📎 *Campos disponibles:*');
+      lines.push(`   \`${prefs.sheet_columns.campos_disponibles.join('`, `')}\``);
+    }
 
     const msg = lines.join('\n');
     await ctx.reply(msg, { parse_mode: 'Markdown' });
+  });
+
+  const FORMAT_FIELD_CHOICES = [
+    { label: '📅 Fecha', field: 'fecha', template: 'DD/MM/YYYY' },
+    { label: '💰 Monto Bs', field: 'bolivares', template: 'Bs{{value}}' },
+    { label: '💵 Monto USD', field: 'dolares', template: '${{value}}' },
+    { label: '🔢 Referencia', field: 'referencia', template: '{{referencia}}' },
+    { label: '📝 Concepto', field: 'concepto', template: '{{concepto}}' },
+    { label: '📱 Pagador', field: 'pagador', template: '{{pagador}}' },
+    { label: '📱 Beneficiario', field: 'beneficiario', template: '{{beneficiario}}' },
+    { label: '🏦 Banco Emisor', field: 'bancoEmisor', template: '{{bancoEmisor}}' },
+    { label: '🏦 Banco Receptor', field: 'bancoReceptor', template: '{{bancoReceptor}}' },
+    { label: '🆔 Cédula', field: 'receptorId', template: '{{receptorId}}' },
+    { label: '👤 Nombre Receptor', field: 'nombreReceptor', template: '{{nombreReceptor}}' },
+    { label: '🏷️ Tipo (Entrada/Salida)', field: 'tipo', template: '{{value}}' },
+    { label: '📎 Ref + Concepto', field: 'especificacion', template: 'Ref: {{reference}} - {{concept}}' },
+    { label: '🏦 Origen → Destino', field: 'bancoFull', template: '{{bancoEmisor}} → {{bancoReceptor}}' },
+  ];
+
+  bot.command('format', async (ctx) => {
+    const user = await requireRegistered(ctx);
+    if (!user) return;
+
+    const creds = await requireCredentials(ctx, user);
+    if (!creds) return;
+
+    const prefs = await getPreferences(user.id);
+    const current = prefs?.sheet_columns;
+    const curCols = current?.columnas?.join(', ') || 'Fecha, Bolivares, Dolares, Especificacion, Entradas/Salidas';
+
+    await ctx.reply(
+      `📐 *Configuración de columnas*\n\n` +
+      `Formato actual: \`${curCols}\`\n\n` +
+      `¿Cuántas columnas quieres en tu hoja? (máximo 10)\n` +
+      `Responde solo con un número.`,
+      { parse_mode: 'Markdown' }
+    );
+
+    pendingConfirmations.set(`format:init:${ctx.chat.id}`, {
+      userId: user.id,
+      steps: [],
+      _createdAt: Date.now(),
+    });
   });
 
   bot.command('status', async (ctx) => {
@@ -433,11 +508,16 @@ async function startBot() {
   });
 
   bot.command('cancelar', async (ctx) => {
-    const confirmKey = `confirm:${ctx.chat.id}`;
-    const choiceKey = `setup:choice:${ctx.chat.id}`;
-    const awaitingKey = `awaiting_sid:${ctx.chat.id}`;
+    const chatId = ctx.chat.id;
+    const confirmKey = `confirm:${chatId}`;
+    const choiceKey = `setup:choice:${chatId}`;
+    const awaitingKey = `awaiting_sid:${chatId}`;
+    const formatInitKey = `format:init:${chatId}`;
+    const formatNameKey = `format:name:${chatId}`;
+    const formatTemplateKey = `format:template:${chatId}`;
+    const formatSaveKey = `format:save:${chatId}`;
 
-    const anyKey = [confirmKey, choiceKey, awaitingKey].find(k => pendingConfirmations.has(k));
+    const anyKey = [confirmKey, choiceKey, awaitingKey, formatInitKey, formatNameKey, formatTemplateKey, formatSaveKey].find(k => pendingConfirmations.has(k));
     if (anyKey) {
       pendingConfirmations.delete(anyKey);
       await ctx.reply('✅ Operación cancelada.');
@@ -491,8 +571,9 @@ async function startBot() {
       '📸 *Envíame una foto* de un Pago Móvil para procesarlo',
       '',
       '🔧 *Configuración*',
-      '/setup — Configurar Google Sheets (SA JSON + Spreadsheet ID)',
+      '/setup — Configurar Google Sheets',
       '/config — Ver configuración actual',
+      '/format — Personalizar columnas de tu hoja',
       '/status — Probar conexión a tu hoja',
       '',
       '📊 *Información*',
@@ -797,6 +878,108 @@ async function startBot() {
       return;
     }
 
+    if (data === 'format_cancel') {
+      const fKey = `format:save:${chatId}`;
+      pendingConfirmations.delete(fKey);
+      for (let i = 0; i < 10; i++) {
+        pendingConfirmations.delete(`format:name:${chatId}:${i}`);
+        pendingConfirmations.delete(`format:template:${chatId}:${i}`);
+      }
+      pendingConfirmations.delete(`format:cols:${chatId}`);
+      await ctx.editMessageText('❌ Formato cancelado.');
+      await ctx.answerCallbackQuery('Cancelado');
+      return;
+    }
+
+    if (data === 'format_save') {
+      const state = pendingConfirmations.get(`format:save:${chatId}`);
+      if (!state) {
+        await ctx.answerCallbackQuery('Sesión expirada');
+        return;
+      }
+
+      const fUserId = state.userId || (await findOrCreateUser(ctx.from?.id || chatId))?.id;
+      if (!fUserId) {
+        await ctx.editMessageText('❌ No se pudo identificar tu usuario. Usa /start primero.');
+        await ctx.answerCallbackQuery('Error');
+        return;
+      }
+
+      try {
+        const mapping = {};
+        const columnas = [];
+
+        state.columns.forEach((col, i) => {
+          columnas.push(col.name);
+          if (col.field && FORMAT_FIELD_CHOICES.some(c => c.field === col.field)) {
+            mapping[col.field === 'bancoFull' ? 'especificacion' : col.field] = {
+              col: i,
+              formato: col.template || '{{value}}',
+            };
+          }
+        });
+
+        if (!mapping.fecha) {
+          await ctx.answerCallbackQuery('Falta columna Fecha');
+          return;
+        }
+
+        await upsertPreferences(fUserId, {
+          sheetColumns: {
+            columnas,
+            mapping,
+            fila_inicio: 2,
+            encabezados: true,
+            campos_disponibles: FORMAT_FIELD_CHOICES.map(c => c.field),
+          },
+        });
+
+        await ctx.editMessageText(
+          `✅ *Formato guardado!*\n\nColumnas: \`${columnas.join('`, `')}\``,
+          { parse_mode: 'Markdown' }
+        );
+        await ctx.answerCallbackQuery('✅ Formato guardado');
+      } catch (err) {
+        await ctx.editMessageText(`❌ Error guardando formato: ${err.message}`);
+        await ctx.answerCallbackQuery('Error');
+      }
+
+      pendingConfirmations.delete(`format:save:${chatId}`);
+      return;
+    }
+
+    if (data.startsWith('fld_')) {
+      const parts = data.split('_');
+      const idx = parseInt(parts[1], 10);
+      const field = parts.slice(2).join('_');
+      const nameKey = `format:name:${chatId}`;
+
+      const state = pendingConfirmations.get(nameKey);
+      if (!state || !state.columns[idx]) {
+        await ctx.answerCallbackQuery('Sesión expirada');
+        return;
+      }
+
+      state.columns[idx].field = field;
+      state.currentCol = idx;
+      pendingConfirmations.delete(nameKey);
+      pendingConfirmations.set(`format:template:${chatId}`, state);
+
+      const choice = FORMAT_FIELD_CHOICES.find(c => c.field === field);
+      const defaultTemplate = choice?.template || '{{value}}';
+
+      await ctx.editMessageText(
+        `Columna "${state.columns[idx].name}": escribe el formato.\n` +
+        `\nUsa \`{{value}}\` para el valor principal y\n` +
+        `\`{{campo}}\` para cualquier campo del parser.\n\n` +
+        `Ejemplo: \`${defaultTemplate}\`\n\n` +
+        `Responde con el formato o escribe "default" para usar ese.`,
+        { parse_mode: 'Markdown' }
+      );
+      await ctx.answerCallbackQuery(choice?.label || field);
+      return;
+    }
+
     if (data.startsWith('oauth_new_')) {
       const state = data.slice(10);
       const session = oauthPending.get(state);
@@ -1000,6 +1183,68 @@ async function startBot() {
     if (ctx.msg.text?.startsWith('/')) return;
 
     const text = ctx.msg.text.trim();
+    const chatId = ctx.chat.id;
+
+    // === FORMAT WIZARD ===
+    const formatInitKey = `format:init:${chatId}`;
+    const formatNameKey = `format:name:${chatId}`;
+    const formatTemplateKey = `format:template:${chatId}`;
+
+    if (pendingConfirmations.has(formatInitKey)) {
+      const initState = pendingConfirmations.get(formatInitKey);
+      const num = parseInt(text, 10);
+      if (isNaN(num) || num < 1 || num > 10) {
+        await ctx.reply('❌ Responde con un número entre 1 y 10.');
+        return;
+      }
+      pendingConfirmations.delete(formatInitKey);
+      pendingConfirmations.set(formatNameKey, {
+        userId: initState.userId,
+        columns: [],
+        totalCols: num,
+        currentCol: 0,
+      });
+      await ctx.reply(`Columna 1 de ${num}: ¿cómo se llama?`);
+      return;
+    }
+
+    if (pendingConfirmations.has(formatNameKey)) {
+      const state = pendingConfirmations.get(formatNameKey);
+      state.columns.push({ name: text });
+      const idx = state.columns.length - 1;
+
+      const keyboard = [];
+      for (let j = 0; j < FORMAT_FIELD_CHOICES.length; j += 2) {
+        const row = [];
+        row.push({ text: FORMAT_FIELD_CHOICES[j].label, callback_data: `fld_${idx}_${FORMAT_FIELD_CHOICES[j].field}` });
+        if (FORMAT_FIELD_CHOICES[j + 1]) {
+          row.push({ text: FORMAT_FIELD_CHOICES[j + 1].label, callback_data: `fld_${idx}_${FORMAT_FIELD_CHOICES[j + 1].field}` });
+        }
+        keyboard.push(row);
+      }
+
+      await ctx.reply(
+        `Columna "${text}": ¿qué dato contiene?`,
+        { reply_markup: { inline_keyboard: keyboard } }
+      );
+      return;
+    }
+
+    if (pendingConfirmations.has(formatTemplateKey)) {
+      const state = pendingConfirmations.get(formatTemplateKey);
+      const col = state.columns[state.currentCol];
+      col.template = text === 'default' ? undefined : text;
+      pendingConfirmations.delete(formatTemplateKey);
+
+      state.currentCol++;
+      if (state.currentCol < state.totalCols) {
+        pendingConfirmations.set(formatNameKey, state);
+        await ctx.reply(`Columna ${state.currentCol + 1} de ${state.totalCols}: ¿cómo se llama?`);
+      } else {
+        await _showFormatSummary(ctx, chatId, state);
+      }
+      return;
+    }
 
     const codeMatch = text.match(/[?&]code=([^&]+)/);
     const stateMatch = text.match(/[?&]state=([^&]+)/);
